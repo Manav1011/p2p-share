@@ -97,7 +97,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onAcceptFile, onSa
                         </div>
                         <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
-                                <span className="text-[10px] uppercase tracking-wider text-gray-500 font-mono">FILE_ID: {msg.content.id.substring(0,6).toUpperCase()}</span>
+                                <span className="text-[10px] uppercase tracking-wider text-gray-500 font-mono">FILE_ID: {(msg.content as FileMetadata).id.substring(0,6).toUpperCase()}</span>
                             </div>
                             <p className="text-sm font-bold text-white truncate font-mono tracking-tight mt-0.5">{(msg.content as FileMetadata).name}</p>
                             <p className="text-xs text-app-accent font-mono mt-0.5">{formatSize((msg.content as FileMetadata).size)}</p>
