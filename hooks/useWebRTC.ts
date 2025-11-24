@@ -1,7 +1,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
-import { Message, FileMetaData, FileChunkData, TextData } from '../types';
+import { Message, FileMetadata, FileChunkData, TextData, FileMetaData } from '../types';
 
 const CHUNK_SIZE = 64 * 1024; // 64KB
 const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB
@@ -182,15 +182,20 @@ export const useWebRTC = () => {
         
         try {
             setIsCalling(true);
+            // This is the specific line that triggers the permission prompt
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             setLocalStream(stream);
 
             const call = peerRef.current.call(connectedPeerId, stream);
             setupCallEvents(call);
-        } catch (err) {
+        } catch (err: any) {
             console.error("Failed to get local stream", err);
-            addSystemMessage("Error: Could not access microphone.");
             setIsCalling(false);
+            if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                addSystemMessage("❌ Microphone permission denied. Please allow microphone access to call.");
+            } else {
+                addSystemMessage("❌ Error accessing microphone. Check your settings.");
+            }
         }
     };
 
@@ -198,15 +203,21 @@ export const useWebRTC = () => {
         if (!incomingCall) return;
 
         try {
+            // Triggers permission prompt for the receiver
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             setLocalStream(stream);
             
             incomingCall.answer(stream);
             setupCallEvents(incomingCall);
             setIncomingCall(null);
-        } catch (err) {
+        } catch (err: any) {
             console.error("Failed to answer call", err);
-            addSystemMessage("Error: Could not access microphone.");
+            setIncomingCall(null);
+            if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                addSystemMessage("❌ Microphone permission denied. Cannot answer call.");
+            } else {
+                addSystemMessage("❌ Error accessing microphone.");
+            }
         }
     };
 
