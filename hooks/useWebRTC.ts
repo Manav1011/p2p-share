@@ -1,6 +1,6 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import Peer, { DataConnection } from 'peerjs';
+import Peer, { DataConnection, MediaConnection } from 'peerjs';
 import { Message, FileMetaData, FileChunkData, TextData } from '../types';
 
 const CHUNK_SIZE = 64 * 1024; // 64KB
@@ -33,6 +33,14 @@ export const useWebRTC = () => {
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
     const [messages, setMessages] = useState<Message[]>([]);
     const [connectedPeerId, setConnectedPeerId] = useState<string>('');
+    
+    // Call State
+    const [incomingCall, setIncomingCall] = useState<MediaConnection | null>(null);
+    const [activeCall, setActiveCall] = useState<MediaConnection | null>(null);
+    const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+    const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+    const [isCalling, setIsCalling] = useState(false); // Outgoing call state
+
     const peerRef = useRef<Peer | null>(null);
     const connRef = useRef<DataConnection | null>(null);
     
@@ -89,6 +97,11 @@ export const useWebRTC = () => {
                 addSystemMessage(`Connected to peer: ${conn.peer}`);
             });
 
+            // Handle Incoming Calls
+            peer.on('call', (call) => {
+                setIncomingCall(call);
+            });
+
             peer.on('error', (err) => {
                 console.error(err);
                 addSystemMessage(`Error: ${err.type}`);
@@ -104,6 +117,7 @@ export const useWebRTC = () => {
         initPeer();
 
         return () => {
+            endCall(); // Cleanup active calls
             peerRef.current?.destroy();
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -132,6 +146,7 @@ export const useWebRTC = () => {
             setConnectedPeerId('');
             addSystemMessage('Peer disconnected');
             connRef.current = null;
+            endCall();
         });
 
         conn.on('error', (err) => {
@@ -159,6 +174,84 @@ export const useWebRTC = () => {
             addSystemMessage(`Failed to connect: ${err.message}`);
         });
     };
+
+    // --- Voice Call Logic ---
+
+    const startCall = async () => {
+        if (!connectedPeerId || !peerRef.current) return;
+        
+        try {
+            setIsCalling(true);
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            setLocalStream(stream);
+
+            const call = peerRef.current.call(connectedPeerId, stream);
+            setupCallEvents(call);
+        } catch (err) {
+            console.error("Failed to get local stream", err);
+            addSystemMessage("Error: Could not access microphone.");
+            setIsCalling(false);
+        }
+    };
+
+    const answerCall = async () => {
+        if (!incomingCall) return;
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            setLocalStream(stream);
+            
+            incomingCall.answer(stream);
+            setupCallEvents(incomingCall);
+            setIncomingCall(null);
+        } catch (err) {
+            console.error("Failed to answer call", err);
+            addSystemMessage("Error: Could not access microphone.");
+        }
+    };
+
+    const rejectCall = () => {
+        if (incomingCall) {
+            incomingCall.close();
+            setIncomingCall(null);
+        }
+    };
+
+    const endCall = () => {
+        if (activeCall) {
+            activeCall.close();
+        }
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+        }
+        
+        setActiveCall(null);
+        setRemoteStream(null);
+        setLocalStream(null);
+        setIsCalling(false);
+        setIncomingCall(null);
+    };
+
+    const setupCallEvents = (call: MediaConnection) => {
+        setActiveCall(call);
+        setIsCalling(false); // Call established
+
+        call.on('stream', (stream) => {
+            setRemoteStream(stream);
+        });
+
+        call.on('close', () => {
+            endCall();
+            addSystemMessage("Call ended");
+        });
+
+        call.on('error', (err) => {
+            console.error("Call error", err);
+            endCall();
+        });
+    };
+
+    // --- End Voice Call Logic ---
 
     const sendText = (text: string, formatted: string) => {
         if (!connRef.current?.open) {
@@ -466,6 +559,16 @@ export const useWebRTC = () => {
         sendText,
         sendFile,
         acceptFileTransfer,
-        saveFileToDisk
+        saveFileToDisk,
+        // Call exports
+        startCall,
+        answerCall,
+        rejectCall,
+        endCall,
+        incomingCall,
+        isCalling,
+        activeCall,
+        remoteStream,
+        localStream
     };
 };

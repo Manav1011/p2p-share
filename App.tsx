@@ -1,10 +1,12 @@
+
 import React, { useState, useEffect } from 'react';
 import { useWebRTC } from './hooks/useWebRTC';
 import { ChatArea } from './components/ChatArea';
 import { InputArea } from './components/InputArea';
 import { QRModal } from './components/QRModal';
+import { CallInterface } from './components/CallInterface';
 import { parseMarkdown } from './utils/markdown';
-import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone } from 'lucide-react';
 
 const App: React.FC = () => {
   const { 
@@ -16,7 +18,17 @@ const App: React.FC = () => {
     sendText, 
     sendFile,
     acceptFileTransfer,
-    saveFileToDisk 
+    saveFileToDisk,
+    // Call props
+    startCall,
+    answerCall,
+    rejectCall,
+    endCall,
+    incomingCall,
+    isCalling,
+    activeCall,
+    remoteStream,
+    localStream
   } = useWebRTC();
 
   const [showQR, setShowQR] = useState(true);
@@ -103,7 +115,7 @@ const App: React.FC = () => {
       <div className="w-full max-w-5xl h-full flex flex-col gap-0 border-x border-white/5 bg-black/40 shadow-2xl relative">
         
         {/* Tactical Header / HUD */}
-        <div className="shrink-0 bg-[#151515] border-b border-white/10 p-0 flex flex-col relative overflow-hidden">
+        <div className="shrink-0 bg-[#151515] border-b border-white/10 p-0 flex flex-col relative overflow-hidden z-50">
             {/* Top decorative line */}
             <div className="h-0.5 w-full bg-gradient-to-r from-transparent via-app-accent to-transparent opacity-50"></div>
             
@@ -117,7 +129,7 @@ const App: React.FC = () => {
                     </h1>
                 </div>
 
-                <div className="flex items-center gap-6 text-xs font-mono">
+                <div className="flex items-center gap-4 sm:gap-6 text-xs font-mono">
                     <div className="hidden sm:flex flex-col items-end">
                         <span className="text-gray-500 uppercase tracking-wider text-[10px]">Your Call Sign</span>
                         <span className="text-app-accent">{myPeerId || 'INITIALIZING...'}</span>
@@ -125,7 +137,7 @@ const App: React.FC = () => {
 
                     <div className="h-8 w-px bg-white/10 hidden sm:block"></div>
 
-                    <div className="flex flex-col items-end min-w-[100px]">
+                    <div className="flex flex-col items-end min-w-[80px] sm:min-w-[100px]">
                         <span className="text-gray-500 uppercase tracking-wider text-[10px]">Link Status</span>
                         {connectionStatus === 'connected' ? (
                              <div className="flex items-center gap-2 text-green-500">
@@ -139,14 +151,27 @@ const App: React.FC = () => {
                              </div>
                         )}
                     </div>
-                    
-                    <button 
-                        onClick={() => setShowQR(true)}
-                        className="bg-white/5 hover:bg-app-accent hover:text-black border border-white/10 text-gray-300 p-2 transition-all duration-200 group"
-                        title="Open Connection Protocol"
-                    >
-                        <QrCode size={18} />
-                    </button>
+
+                    <div className="flex gap-2">
+                        {/* Call Button */}
+                        {connectionStatus === 'connected' && !activeCall && !isCalling && (
+                            <button
+                                onClick={startCall}
+                                className="bg-green-900/20 hover:bg-green-600 hover:text-white border border-green-900/50 text-green-500 p-2 transition-all duration-200 group rounded-sm"
+                                title="Initiate Voice Link"
+                            >
+                                <Phone size={18} />
+                            </button>
+                        )}
+
+                        <button 
+                            onClick={() => setShowQR(true)}
+                            className="bg-white/5 hover:bg-app-accent hover:text-black border border-white/10 text-gray-300 p-2 transition-all duration-200 group rounded-sm"
+                            title="Open Connection Protocol"
+                        >
+                            <QrCode size={18} />
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -159,6 +184,18 @@ const App: React.FC = () => {
                 <div>SYS.VER.2.0.4</div>
             </div>
         </div>
+
+        {/* Call Interface Overlay */}
+        <CallInterface 
+            incomingCall={incomingCall}
+            isCalling={isCalling}
+            activeCall={activeCall}
+            remoteStream={remoteStream}
+            localStream={localStream}
+            onAnswer={answerCall}
+            onReject={rejectCall}
+            onEnd={endCall}
+        />
 
         {/* Chat Area */}
         <ChatArea 
