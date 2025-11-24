@@ -113,7 +113,7 @@ const App: React.FC = () => {
                         EPISODE 1
                     </div>
                     <h1 className="text-white text-lg font-bold tracking-tight uppercase">
-                        WebRTC Share <span className="text-gray-500 font-normal mx-2">//</span> SECURE UPLINK
+                        P2P Share <span className="text-gray-500 font-normal mx-2">//</span> SECURE UPLINK
                     </h1>
                 </div>
 
