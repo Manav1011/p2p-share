@@ -119,17 +119,17 @@ const App: React.FC = () => {
             {/* Top decorative line */}
             <div className="h-0.5 w-full bg-gradient-to-r from-transparent via-app-accent to-transparent opacity-50"></div>
             
-            <div className="p-4 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                    <div className="bg-app-accent text-black font-bold px-2 py-0.5 text-xs tracking-widest uppercase">
+            <div className="p-3 sm:p-4 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 sm:gap-3 overflow-hidden">
+                    <div className="bg-app-accent text-black font-bold px-1.5 py-0.5 text-[10px] sm:text-xs tracking-widest uppercase shrink-0">
                         EPISODE 1
                     </div>
-                    <h1 className="text-white text-lg font-bold tracking-tight uppercase">
-                        P2P Share <span className="text-gray-500 font-normal mx-2">//</span> SECURE UPLINK
+                    <h1 className="text-white text-sm sm:text-lg font-bold tracking-tight uppercase truncate">
+                        P2P Share <span className="hidden sm:inline text-gray-500 font-normal mx-2">//</span> <span className="hidden sm:inline">SECURE UPLINK</span>
                     </h1>
                 </div>
 
-                <div className="flex items-center gap-4 sm:gap-6 text-xs font-mono">
+                <div className="flex items-center gap-3 sm:gap-6 text-xs font-mono shrink-0">
                     <div className="hidden sm:flex flex-col items-end">
                         <span className="text-gray-500 uppercase tracking-wider text-[10px]">Your Call Sign</span>
                         <span className="text-app-accent">{myPeerId || 'INITIALIZING...'}</span>
@@ -137,39 +137,39 @@ const App: React.FC = () => {
 
                     <div className="h-8 w-px bg-white/10 hidden sm:block"></div>
 
-                    <div className="flex flex-col items-end min-w-[80px] sm:min-w-[100px]">
-                        <span className="text-gray-500 uppercase tracking-wider text-[10px]">Link Status</span>
+                    <div className="flex flex-col items-end justify-center min-w-[60px] sm:min-w-[100px]">
+                        <span className="hidden sm:block text-gray-500 uppercase tracking-wider text-[10px]">Link Status</span>
                         {connectionStatus === 'connected' ? (
-                             <div className="flex items-center gap-2 text-green-500">
+                             <div className="flex items-center gap-1.5 sm:gap-2 text-green-500">
                                  <Activity size={12} className="animate-pulse" />
-                                 <span>ONLINE</span>
+                                 <span className="font-bold">ONLINE</span>
                              </div>
                         ) : (
-                             <div className="flex items-center gap-2 text-red-500">
+                             <div className="flex items-center gap-1.5 sm:gap-2 text-red-500">
                                  <Radio size={12} />
-                                 <span>OFFLINE</span>
+                                 <span className="font-bold">OFFLINE</span>
                              </div>
                         )}
                     </div>
 
-                    <div className="flex gap-2">
+                    <div className="flex gap-1.5 sm:gap-2">
                         {/* Call Button */}
                         {connectionStatus === 'connected' && !activeCall && !isCalling && (
                             <button
                                 onClick={startCall}
-                                className="bg-green-900/20 hover:bg-green-600 hover:text-white border border-green-900/50 text-green-500 p-2 transition-all duration-200 group rounded-sm"
+                                className="bg-green-900/20 hover:bg-green-600 hover:text-white border border-green-900/50 text-green-500 p-1.5 sm:p-2 transition-all duration-200 group rounded-sm"
                                 title="Initiate Voice Link"
                             >
-                                <Phone size={18} />
+                                <Phone size={16} className="sm:w-[18px] sm:h-[18px]" />
                             </button>
                         )}
 
                         <button 
                             onClick={() => setShowQR(true)}
-                            className="bg-white/5 hover:bg-app-accent hover:text-black border border-white/10 text-gray-300 p-2 transition-all duration-200 group rounded-sm"
+                            className="bg-white/5 hover:bg-app-accent hover:text-black border border-white/10 text-gray-300 p-1.5 sm:p-2 transition-all duration-200 group rounded-sm"
                             title="Open Connection Protocol"
                         >
-                            <QrCode size={18} />
+                            <QrCode size={16} className="sm:w-[18px] sm:h-[18px]" />
                         </button>
                     </div>
                 </div>
@@ -177,11 +177,11 @@ const App: React.FC = () => {
 
             {/* Sub-header / Status Bar */}
             <div className="bg-black/40 border-t border-white/5 px-4 py-1 flex justify-between items-center text-[10px] uppercase tracking-widest text-gray-500 font-mono">
-                <div className="flex gap-4">
-                   <span>Encrypted: {connectionStatus === 'connected' ? <ShieldCheck size={10} className="inline text-app-accent mb-0.5"/> : <ShieldAlert size={10} className="inline mb-0.5"/>}</span>
-                   {connectedPeerId && <span>Target: {connectedPeerId}</span>}
+                <div className="flex gap-4 overflow-hidden">
+                   <span className="shrink-0">Encrypted: {connectionStatus === 'connected' ? <ShieldCheck size={10} className="inline text-app-accent mb-0.5"/> : <ShieldAlert size={10} className="inline mb-0.5"/>}</span>
+                   {connectedPeerId && <span className="hidden sm:inline truncate">Target: {connectedPeerId}</span>}
                 </div>
-                <div>SYS.VER.2.0.4</div>
+                <div className="shrink-0">SYS.VER.2.0.4</div>
             </div>
         </div>
 

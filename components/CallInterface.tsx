@@ -67,7 +67,7 @@ export const CallInterface: React.FC<CallInterfaceProps> = ({
     // 1. Incoming Call Overlay
     if (incomingCall) {
         return (
-            <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50 w-72 bg-black/90 border border-app-accent shadow-[0_0_30px_rgba(255,101,0,0.3)] p-4 animate-in slide-in-from-top-4 fade-in duration-300">
+            <div className="absolute top-28 left-1/2 -translate-x-1/2 z-[60] w-72 bg-black/90 border border-app-accent shadow-[0_0_30px_rgba(255,101,0,0.3)] p-4 animate-in slide-in-from-top-4 fade-in duration-300">
                 <div className="flex flex-col items-center gap-4">
                     <div className="relative">
                         <div className="absolute inset-0 bg-app-accent rounded-full animate-ping opacity-75"></div>
@@ -101,7 +101,7 @@ export const CallInterface: React.FC<CallInterfaceProps> = ({
     // 2. Outgoing Call Overlay
     if (isCalling) {
         return (
-            <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50 w-72 bg-black/90 border border-white/20 p-4">
+            <div className="absolute top-28 left-1/2 -translate-x-1/2 z-[60] w-72 bg-black/90 border border-white/20 p-4">
                 <div className="flex flex-col items-center gap-4">
                     <div className="bg-white/10 p-3 rounded-full animate-pulse">
                         <Phone size={24} className="text-white" />
@@ -121,10 +121,10 @@ export const CallInterface: React.FC<CallInterfaceProps> = ({
         );
     }
 
-    // 3. Active Call Bar (Floating or embedded in header)
+    // 3. Active Call Bar (Inserted in flow, not absolute)
     if (activeCall) {
         return (
-            <div className="absolute top-[60px] left-0 right-0 z-40 bg-black/80 backdrop-blur-md border-b border-app-accent/30 py-2 px-4 flex justify-between items-center">
+            <div className="w-full shrink-0 z-40 bg-[#121212] border-b border-app-accent/30 py-3 px-4 flex justify-between items-center shadow-lg animate-in slide-in-from-top-2 fade-in duration-300">
                 {/* Hidden Audio Element */}
                 <audio ref={audioRef} autoPlay />
 
