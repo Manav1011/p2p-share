@@ -1,0 +1,7 @@
+{
+  "name": "WebRTC Share",
+  "description": "A peer-to-peer file sharing and chat application using WebRTC.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

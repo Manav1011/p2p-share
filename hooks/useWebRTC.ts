@@ -1,0 +1,471 @@
+
+import { useEffect, useRef, useState, useCallback } from 'react';
+import Peer, { DataConnection } from 'peerjs';
+import { Message, FileMetaData, FileChunkData, TextData } from '../types';
+
+const CHUNK_SIZE = 64 * 1024; // 64KB
+const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB
+const UI_UPDATE_INTERVAL = 200; // ms
+
+// Helper to guess MIME type if missing
+const getFallbackMimeType = (name: string) => {
+    const ext = name.split('.').pop()?.toLowerCase();
+    switch (ext) {
+        case 'png': return 'image/png';
+        case 'jpg': case 'jpeg': return 'image/jpeg';
+        case 'gif': return 'image/gif';
+        case 'webp': return 'image/webp';
+        case 'svg': return 'image/svg+xml';
+        case 'mp4': return 'video/mp4';
+        case 'webm': return 'video/webm';
+        case 'ogg': return 'video/ogg';
+        case 'pdf': return 'application/pdf';
+        case 'txt': return 'text/plain';
+        case 'html': return 'text/html';
+        case 'json': return 'application/json';
+        case 'md': return 'text/markdown';
+        default: return 'application/octet-stream';
+    }
+};
+
+export const useWebRTC = () => {
+    const [myPeerId, setMyPeerId] = useState<string>('');
+    const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+    const [messages, setMessages] = useState<Message[]>([]);
+    const [connectedPeerId, setConnectedPeerId] = useState<string>('');
+    const peerRef = useRef<Peer | null>(null);
+    const connRef = useRef<DataConnection | null>(null);
+    
+    // File Transfer Refs
+    const fileReceivers = useRef<Map<string, any>>(new Map());
+
+    const addMessage = useCallback((msg: Message) => {
+        setMessages(prev => [...prev, msg]);
+    }, []);
+
+    const addSystemMessage = useCallback((text: string) => {
+        addMessage({
+            id: Math.random().toString(36),
+            type: 'text',
+            content: text,
+            sender: 'system',
+            timestamp: Date.now()
+        });
+    }, [addMessage]);
+
+    // Helper for legacy download (fallback)
+    const triggerLegacyDownload = (url: string, name: string) => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+    };
+
+    useEffect(() => {
+        const initPeer = async () => {
+            const randomId = Math.random().toString(36).substring(2, 6);
+            const peer = new Peer(randomId, {
+                debug: 2,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:global.stun.twilio.com:3478' }
+                    ]
+                }
+            });
+
+            peer.on('open', (id) => {
+                setMyPeerId(id);
+                addSystemMessage(`Your ID: ${id}`);
+            });
+
+            peer.on('connection', (conn) => {
+                connRef.current = conn;
+                setConnectionStatus('connected');
+                setConnectedPeerId(conn.peer);
+                setupConnection(conn);
+                addSystemMessage(`Connected to peer: ${conn.peer}`);
+            });
+
+            peer.on('error', (err) => {
+                console.error(err);
+                addSystemMessage(`Error: ${err.type}`);
+            });
+
+            peer.on('disconnected', () => {
+                 setConnectionStatus('disconnected');
+            });
+
+            peerRef.current = peer;
+        };
+
+        initPeer();
+
+        return () => {
+            peerRef.current?.destroy();
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const setupConnection = (conn: DataConnection) => {
+        conn.on('data', async (data: any) => {
+            if (data.type === 'text') {
+                addMessage({
+                    id: Math.random().toString(36),
+                    type: 'text',
+                    content: data.content,
+                    formatted: data.formatted,
+                    sender: 'peer',
+                    timestamp: Date.now()
+                });
+            } else if (data.type === 'file-meta') {
+                handleFileMeta(data);
+            } else if (data.type === 'file-chunk') {
+                handleFileChunk(data);
+            }
+        });
+
+        conn.on('close', () => {
+            setConnectionStatus('disconnected');
+            setConnectedPeerId('');
+            addSystemMessage('Peer disconnected');
+            connRef.current = null;
+        });
+
+        conn.on('error', (err) => {
+            addSystemMessage(`Connection error: ${err.message}`);
+        });
+    };
+
+    const connectToPeer = (peerId: string) => {
+        if (!peerRef.current) return;
+        setConnectionStatus('connecting');
+        addSystemMessage(`Connecting to ${peerId}...`);
+        
+        const conn = peerRef.current.connect(peerId, { reliable: true });
+        connRef.current = conn;
+        
+        conn.on('open', () => {
+            setConnectionStatus('connected');
+            setConnectedPeerId(peerId);
+            setupConnection(conn);
+            addSystemMessage(`Connected to ${peerId}`);
+        });
+        
+        conn.on('error', (err) => {
+            setConnectionStatus('disconnected');
+            addSystemMessage(`Failed to connect: ${err.message}`);
+        });
+    };
+
+    const sendText = (text: string, formatted: string) => {
+        if (!connRef.current?.open) {
+            addSystemMessage('Not connected');
+            return;
+        }
+        
+        connRef.current.send({
+            type: 'text',
+            content: text,
+            formatted
+        } as TextData);
+
+        addMessage({
+            id: Math.random().toString(36),
+            type: 'text',
+            content: text,
+            formatted,
+            sender: 'me',
+            timestamp: Date.now()
+        });
+    };
+
+    const sendFile = async (file: File) => {
+        if (!connRef.current?.open) return;
+        const conn = connRef.current;
+        const fileId = Math.random().toString(36).substring(2);
+        
+        addMessage({
+            id: fileId,
+            type: 'file',
+            content: { id: fileId, name: file.name, size: file.size },
+            sender: 'me',
+            timestamp: Date.now(),
+            progress: 0
+        });
+
+        conn.send({
+            type: 'file-meta',
+            id: fileId,
+            name: file.name,
+            size: file.size,
+            chunkSize: CHUNK_SIZE,
+            mimeType: file.type || getFallbackMimeType(file.name)
+        } as FileMetaData);
+
+        let offset = 0;
+        let lastUiUpdate = 0;
+        const dataChannel = conn.dataChannel as any; // Cast to any to avoid type issues with PeerJS vs standard WebRTC types
+        
+        // Try to set low threshold for smoother backpressure
+        try {
+            if (dataChannel && 'bufferedAmountLowThreshold' in dataChannel) {
+                dataChannel.bufferedAmountLowThreshold = 64 * 1024; 
+            }
+        } catch (e) {
+            // Ignore if property setting fails
+        }
+
+        while (offset < file.size) {
+            // Backpressure Control: Wait if buffer is full
+            if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await new Promise<void>(resolve => {
+                    const onLowBuffer = () => {
+                        dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
+                        resolve();
+                    };
+                    dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
+                    
+                    // Fail-safe / Polling fallback
+                    const checkInterval = setInterval(() => {
+                        if (dataChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
+                             dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
+                             clearInterval(checkInterval);
+                             resolve();
+                        }
+                    }, 100);
+                });
+            }
+
+            const chunk = file.slice(offset, offset + CHUNK_SIZE);
+            const buffer = await chunk.arrayBuffer();
+            
+            conn.send({
+                type: 'file-chunk',
+                id: fileId,
+                chunk: new Uint8Array(buffer),
+                offset,
+                size: file.size
+            });
+
+            offset += CHUNK_SIZE;
+            
+            // Throttled UI Updates
+            const now = Date.now();
+            if (now - lastUiUpdate > UI_UPDATE_INTERVAL || offset >= file.size) {
+                lastUiUpdate = now;
+                const progress = Math.min(100, (offset / file.size) * 100);
+                setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
+                
+                // Minimal yield to allow UI rendering
+                await new Promise(r => setTimeout(r, 0)); 
+            }
+        }
+    };
+
+    const handleFileMeta = async (data: FileMetaData) => {
+        addSystemMessage(`Receiving ${data.name}...`);
+        
+        const receiver = {
+            id: data.id,
+            name: data.name,
+            size: data.size,
+            mimeType: data.mimeType || getFallbackMimeType(data.name),
+            receivedBytes: 0,
+            chunks: new Map<number, Uint8Array>(),
+            receivedChunks: new Set<number>(),
+            lastUpdate: 0,
+            writable: null, // For disk streaming
+            fileHandle: null,
+        };
+
+        fileReceivers.current.set(data.id, receiver);
+
+        // Check if environment likely supports FSA (not perfect, but a first check)
+        const supportsFSA = 'showSaveFilePicker' in window;
+
+        addMessage({
+            id: data.id,
+            type: 'file',
+            content: { id: data.id, name: data.name, size: data.size },
+            sender: 'peer',
+            timestamp: Date.now(),
+            progress: 0,
+            needsAcceptance: supportsFSA
+        });
+    };
+
+    const acceptFileTransfer = async (fileId: string) => {
+        const receiver = fileReceivers.current.get(fileId);
+        if (!receiver) return;
+
+        try {
+            // Attempt to show the file picker
+            const handle = await window.showSaveFilePicker({
+                suggestedName: receiver.name
+            });
+            const writable = await handle.createWritable();
+            
+            receiver.fileHandle = handle;
+            receiver.writable = writable;
+
+            // Flush existing memory buffer to disk
+            if (receiver.chunks.size > 0) {
+                const sortedChunks = Array.from(receiver.chunks.entries())
+                    .sort((a: any, b: any) => a[0] - b[0])
+                    .map((entry: any) => entry[1]);
+                
+                for (const chunk of sortedChunks) {
+                    await writable.write(chunk);
+                }
+                
+                // Free RAM!
+                receiver.chunks.clear();
+            }
+
+            // Update UI to remove the accept button
+            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
+
+            // If the transfer was already finished in RAM before we accepted, close it now
+            if (receiver.receivedBytes >= receiver.size) {
+                finishFileReceive(receiver);
+            }
+
+        } catch (err: any) {
+            // Remove the prompt button regardless of error type to prevent stuck state
+            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
+
+            // Handle SecurityError/Cross-Origin (iframe restrictions)
+            if (err.name === 'SecurityError' || (err.message && err.message.includes('Cross origin'))) {
+                addSystemMessage("⚠️ Direct Disk Access is blocked in this preview window. Using RAM instead.");
+                addSystemMessage("ℹ️ To stream directly to disk (unlimited size), open this app in a full browser tab.");
+            } else if (err.name !== 'AbortError') {
+                 // Other errors
+                 console.error('File save init failed:', err);
+                 addSystemMessage(`Stream setup failed: ${err.message}. Buffering in RAM.`);
+            }
+            
+            // Note: We do NOT stop the transfer. We just fall back to the default RAM behavior 
+            // because 'receiver.writable' remains null.
+        }
+    };
+
+    const saveFileToDisk = async (blobUrl: string, fileName: string) => {
+        // Fallback for browsers without FSA
+        if (!('showSaveFilePicker' in window)) {
+            triggerLegacyDownload(blobUrl, fileName);
+            return;
+        }
+
+        try {
+            const response = await fetch(blobUrl);
+            const blob = await response.blob();
+            
+            const handle = await window.showSaveFilePicker({
+                suggestedName: fileName
+            });
+            
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+            
+            addSystemMessage(`Saved ${fileName} to disk`);
+        } catch (err: any) {
+             // If aborted by user, do nothing
+             if (err.name === 'AbortError') return;
+
+             console.warn('FSA Save failed, falling back to legacy download:', err);
+             
+             // Specific handling for iframe/preview environment
+             if (err.name === 'SecurityError' || (err.message && err.message.includes('Cross origin'))) {
+                 addSystemMessage("⚠️ Save to Folder blocked in Preview. Downloading to default folder.");
+             }
+             
+             // Fallback to standard download if FSA fails
+             triggerLegacyDownload(blobUrl, fileName);
+        }
+    };
+
+    const handleFileChunk = async (data: FileChunkData) => {
+        const receiver = fileReceivers.current.get(data.id);
+        if (!receiver) return;
+
+        if (!receiver.receivedChunks.has(data.offset)) {
+            receiver.receivedChunks.add(data.offset);
+            
+            if (receiver.writable) {
+                // Write directly to disk
+                await receiver.writable.write(data.chunk);
+            } else {
+                // Buffer in RAM (Fallback)
+                receiver.chunks.set(data.offset, data.chunk);
+            }
+            
+            receiver.receivedBytes += data.chunk.byteLength;
+        }
+
+        // Throttled receiver updates
+        const now = Date.now();
+        if (receiver.receivedBytes >= receiver.size || (now - receiver.lastUpdate > UI_UPDATE_INTERVAL)) {
+            receiver.lastUpdate = now;
+            const progress = (receiver.receivedBytes / receiver.size) * 100;
+            setMessages(prev => prev.map(m => m.id === data.id ? { ...m, progress } : m));
+        }
+
+        if (receiver.receivedBytes >= receiver.size) {
+            finishFileReceive(receiver);
+        }
+    };
+
+    const finishFileReceive = async (receiver: any) => {
+        let url;
+
+        if (receiver.writable) {
+            // Close the file stream
+            try {
+                await receiver.writable.close();
+                // Get the file back from the handle to create a preview URL
+                const file = await receiver.fileHandle.getFile();
+                const type = receiver.mimeType || getFallbackMimeType(receiver.name);
+                const typedFile = file.slice(0, file.size, type);
+                url = URL.createObjectURL(typedFile);
+                addSystemMessage(`Saved ${receiver.name} to disk`);
+            } catch (e) {
+                console.error("Error closing file stream", e);
+            }
+        } else {
+            // Memory Fallback
+            const sortedChunks = Array.from(receiver.chunks.entries())
+                .sort((a: any, b: any) => a[0] - b[0])
+                .map((entry: any) => entry[1]);
+            
+            const type = receiver.mimeType || getFallbackMimeType(receiver.name);
+            const blob = new Blob(sortedChunks, { type });
+            url = URL.createObjectURL(blob);
+            addSystemMessage(`Received ${receiver.name}`);
+        }
+
+        setMessages(prev => prev.map(m => m.id === receiver.id ? { 
+            ...m, 
+            progress: 100,
+            blobUrl: url,
+            needsAcceptance: false
+        } : m));
+        
+        fileReceivers.current.delete(receiver.id);
+    };
+
+    return {
+        myPeerId,
+        connectionStatus,
+        connectedPeerId,
+        messages,
+        connectToPeer,
+        sendText,
+        sendFile,
+        acceptFileTransfer,
+        saveFileToDisk
+    };
+};
