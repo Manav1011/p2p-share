@@ -95,9 +95,12 @@ export const InputArea: React.FC<InputAreaProps> = ({ onSend, onFileUpload, pars
           <input 
             type="file" 
             ref={fileInputRef} 
-            className="hidden" 
+            className="hidden"
+            multiple
             onChange={(e) => {
-                if(e.target.files?.[0]) onFileUpload(e.target.files[0]);
+                if(e.target.files && e.target.files.length > 0) {
+                    Array.from(e.target.files).forEach(file => onFileUpload(file));
+                }
                 e.target.value = ''; 
             }}
           />
@@ -106,7 +109,7 @@ export const InputArea: React.FC<InputAreaProps> = ({ onSend, onFileUpload, pars
             <button 
                 onClick={() => fileInputRef.current?.click()}
                 className="text-gray-500 hover:text-app-accent transition-colors p-1"
-                title="Attach Data"
+                title="Attach Data (Multi-select supported)"
             >
                 <Paperclip size={20} />
             </button>

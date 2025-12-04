@@ -3,9 +3,10 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
 import { Message, FileMetadata, FileChunkData, TextData, FileMetaData } from '../types';
 
-const CHUNK_SIZE = 64 * 1024; // 64KB - Smaller chunks for smoother flow control
+const CHUNK_SIZE = 512 * 1024; // 512KB - Optimized for speed
 const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB
-const UI_UPDATE_INTERVAL = 200; // ms
+const BACKPRESSURE_RESUME_THRESHOLD = 12 * 1024 * 1024; // 12MB - Resume at 75% capacity
+const UI_UPDATE_INTERVAL = 1000; // 1s - Reduced UI updates for better performance
 
 // Helper to guess MIME type if missing
 const getFallbackMimeType = (name: string) => {
@@ -78,7 +79,10 @@ export const useWebRTC = () => {
                 config: {
                     iceServers: [
                         { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:global.stun.twilio.com:3478' }
+                        { urls: 'stun:global.stun.twilio.com:3478' },
+                        { urls: 'stun:stun1.l.google.com:19302' },
+                        { urls: 'stun:stun2.l.google.com:19302' },
+                        { urls: 'stun:stun.services.mozilla.com' }
                     ]
                 }
             });
@@ -121,7 +125,7 @@ export const useWebRTC = () => {
     }, []);
 
     const setupConnection = (conn: DataConnection) => {
-        conn.on('data', async (data: any) => {
+        conn.on('data', (data: any) => {
             if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
                 handleBinaryChunk(data);
                 return;
@@ -158,7 +162,7 @@ export const useWebRTC = () => {
         });
     };
 
-    const handleBinaryChunk = async (data: ArrayBuffer | Uint8Array) => {
+    const handleBinaryChunk = (data: ArrayBuffer | Uint8Array) => {
         const buffer = data instanceof Uint8Array ? data.buffer : data;
         const array = new Uint8Array(buffer); // Zero-copy view
         const view = new DataView(buffer);
@@ -187,7 +191,10 @@ export const useWebRTC = () => {
         setConnectionStatus('connecting');
         addSystemMessage(`Connecting to ${peerId}...`);
         
-        const conn = peerRef.current.connect(peerId, { reliable: true });
+        const conn = peerRef.current.connect(peerId, { 
+            reliable: true,
+            serialization: 'binary'
+        });
         connRef.current = conn;
         
         conn.on('open', () => {
@@ -343,7 +350,7 @@ export const useWebRTC = () => {
         
         try {
             if (dataChannel && 'bufferedAmountLowThreshold' in dataChannel) {
-                dataChannel.bufferedAmountLowThreshold = CHUNK_SIZE; 
+                dataChannel.bufferedAmountLowThreshold = CHUNK_SIZE * 2; 
             }
         } catch (e) { }
 
@@ -356,6 +363,9 @@ export const useWebRTC = () => {
 
         // Pipelining: Start reading the first chunk immediately
         let nextChunkPromise = readChunk(0);
+        
+        // Use ref for progress tracking to avoid excessive state updates
+        const progressRef = { lastReported: 0 };
 
         try {
             while (offset < file.size) {
@@ -373,7 +383,7 @@ export const useWebRTC = () => {
                         };
                         dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
                         
-                        // Failsafe timeout in case event doesn't fire
+                        // Failsafe: Poll and resume at 75% capacity for better throughput
                         const checkInterval = setInterval(() => {
                             if (!conn.open) {
                                 clearInterval(checkInterval);
@@ -381,12 +391,12 @@ export const useWebRTC = () => {
                                 reject(new Error("Connection closed"));
                                 return;
                             }
-                            if (dataChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
+                            if (dataChannel.bufferedAmount <= BACKPRESSURE_RESUME_THRESHOLD) {
                                 dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
                                 clearInterval(checkInterval);
                                 resolve();
                             }
-                        }, 100);
+                        }, 50);
                     });
                 }
 
@@ -415,16 +425,19 @@ export const useWebRTC = () => {
                 offset += chunkData.length;
                 
                 const now = Date.now();
-                if (now - lastUiUpdate > UI_UPDATE_INTERVAL || offset >= file.size) {
+                const currentProgress = Math.min(100, (offset / file.size) * 100);
+                
+                // Only update UI if enough time passed AND progress changed significantly
+                if ((now - lastUiUpdate > UI_UPDATE_INTERVAL && currentProgress - progressRef.lastReported >= 1) || offset >= file.size) {
                     lastUiUpdate = now;
-                    const buffered = dataChannel?.bufferedAmount || 0;
-                    // Note: bufferedAmount might include data from previous chunks, but this is a good enough approx
-                    const actualBytesSent = Math.max(0, offset - buffered);
-                    const progress = Math.min(100, (actualBytesSent / file.size) * 100);
+                    progressRef.lastReported = currentProgress;
                     
-                    setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
+                    setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: currentProgress } : m));
                 }
             }
+            
+            // Ensure 100% is set at the end
+            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: 100 } : m));
         } catch (e) {
             console.error("Transfer failed:", e);
             setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: -1 } : m));
@@ -432,7 +445,7 @@ export const useWebRTC = () => {
         }
     };
 
-    const handleFileMeta = async (data: FileMetaData) => {
+    const handleFileMeta = (data: FileMetaData) => {
         addSystemMessage(`Receiving ${data.name}...`);
         
         const receiver = {
@@ -444,6 +457,7 @@ export const useWebRTC = () => {
             chunks: new Map<number, Uint8Array>(),
             receivedChunks: new Set<number>(),
             lastUpdate: 0,
+            lastProgress: 0,
             writable: null,
             fileHandle: null,
             writeBuffer: [] as Uint8Array[], 
@@ -547,7 +561,7 @@ export const useWebRTC = () => {
         receiver.writeBuffer = [];
         receiver.writeBufferSize = 0;
 
-        // 2. Schedule write in the queue
+        // 2. Write asynchronously without blocking
         receiver.writeQueue = receiver.writeQueue.then(async () => {
             try {
                 const blob = new Blob(chunksToWrite);
@@ -556,10 +570,12 @@ export const useWebRTC = () => {
                 console.error("Error writing to disk", err);
                 addSystemMessage("Error writing to disk - file may be corrupt");
             }
+        }).catch(err => {
+            console.error("Write queue error:", err);
         });
     };
 
-    const handleFileChunk = async (data: FileChunkData) => {
+    const handleFileChunk = (data: FileChunkData) => {
         const receiver = fileReceivers.current.get(data.id);
         if (!receiver) return;
 
@@ -571,9 +587,9 @@ export const useWebRTC = () => {
                 receiver.writeBuffer.push(data.chunk);
                 receiver.writeBufferSize += data.chunk.byteLength;
 
-                // Flush if buffer > 16MB
+                // Flush asynchronously - don't await to avoid blocking
                 if (receiver.writeBufferSize >= MAX_BUFFERED_AMOUNT) {
-                    await flushWriteBuffer(receiver);
+                    flushWriteBuffer(receiver);
                 }
             } else {
                 // Buffer in RAM (Fallback)
@@ -584,10 +600,17 @@ export const useWebRTC = () => {
         }
 
         const now = Date.now();
-        if (receiver.receivedBytes >= receiver.size || (now - receiver.lastUpdate > UI_UPDATE_INTERVAL)) {
+        const currentProgress = (receiver.receivedBytes / receiver.size) * 100;
+        
+        // Only update UI if enough time passed AND progress changed significantly OR transfer complete
+        if (receiver.receivedBytes >= receiver.size || (now - receiver.lastUpdate > UI_UPDATE_INTERVAL && currentProgress - (receiver.lastProgress || 0) >= 1)) {
             receiver.lastUpdate = now;
-            const progress = (receiver.receivedBytes / receiver.size) * 100;
-            setMessages(prev => prev.map(m => m.id === data.id ? { ...m, progress } : m));
+            receiver.lastProgress = currentProgress;
+            
+            // Use requestAnimationFrame to defer UI update and not block data reception
+            requestAnimationFrame(() => {
+                setMessages(prev => prev.map(m => m.id === data.id ? { ...m, progress: currentProgress } : m));
+            });
         }
 
         if (receiver.receivedBytes >= receiver.size) {
