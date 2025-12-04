@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
 import { Message, FileMetadata, FileChunkData, TextData, FileMetaData } from '../types';
 
-const CHUNK_SIZE = 256 * 1024; // 256KB
+const CHUNK_SIZE = 64 * 1024; // 64KB - Smaller chunks for smoother flow control
 const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB
 const UI_UPDATE_INTERVAL = 200; // ms
 
@@ -152,6 +152,8 @@ export const useWebRTC = () => {
         });
 
         conn.on('error', (err) => {
+            // Suppress trivial errors on close
+            if (err.message?.includes('Connection is not open')) return;
             addSystemMessage(`Connection error: ${err.message}`);
         });
     };
@@ -341,59 +343,92 @@ export const useWebRTC = () => {
         
         try {
             if (dataChannel && 'bufferedAmountLowThreshold' in dataChannel) {
-                dataChannel.bufferedAmountLowThreshold = 64 * 1024; 
+                dataChannel.bufferedAmountLowThreshold = CHUNK_SIZE; 
             }
         } catch (e) { }
 
-        while (offset < file.size) {
-            if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                await new Promise<void>(resolve => {
-                    const onLowBuffer = () => {
-                        dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
-                        resolve();
-                    };
-                    dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
-                    
-                    const checkInterval = setInterval(() => {
-                        if (dataChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
-                             dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
-                             clearInterval(checkInterval);
-                             resolve();
-                        }
-                    }, 100);
-                });
-            }
-
-            const chunk = file.slice(offset, offset + CHUNK_SIZE);
+        // Helper to read chunk from file
+        const readChunk = async (start: number): Promise<Uint8Array> => {
+            const chunk = file.slice(start, start + CHUNK_SIZE);
             const buffer = await chunk.arrayBuffer();
-            const chunkData = new Uint8Array(buffer);
+            return new Uint8Array(buffer);
+        };
 
-            // Construct Binary Packet: [ID_LEN (1)][ID BYTES][OFFSET (8)][DATA]
-            const headerSize = 1 + idBytes.length + 8;
-            const packet = new Uint8Array(headerSize + chunkData.length);
-            const view = new DataView(packet.buffer);
+        // Pipelining: Start reading the first chunk immediately
+        let nextChunkPromise = readChunk(0);
 
-            packet[0] = idBytes.length;
-            packet.set(idBytes, 1);
-            view.setBigUint64(1 + idBytes.length, BigInt(offset));
-            packet.set(chunkData, headerSize);
+        try {
+            while (offset < file.size) {
+                // Check if connection died mid-transfer
+                if (!conn.open) {
+                    throw new Error("Connection closed during transfer");
+                }
 
-            conn.send(packet);
+                // Backpressure: Wait if buffer is full
+                if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                    await new Promise<void>((resolve, reject) => {
+                        const onLowBuffer = () => {
+                            dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
+                            resolve();
+                        };
+                        dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
+                        
+                        // Failsafe timeout in case event doesn't fire
+                        const checkInterval = setInterval(() => {
+                            if (!conn.open) {
+                                clearInterval(checkInterval);
+                                dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
+                                reject(new Error("Connection closed"));
+                                return;
+                            }
+                            if (dataChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
+                                dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
+                                clearInterval(checkInterval);
+                                resolve();
+                            }
+                        }, 100);
+                    });
+                }
 
-            offset += CHUNK_SIZE;
-            
-            const now = Date.now();
-            if (now - lastUiUpdate > UI_UPDATE_INTERVAL || offset >= file.size) {
-                lastUiUpdate = now;
+                // Await the data we started reading in previous iteration (or init)
+                const chunkData = await nextChunkPromise;
+
+                // PIPELINE: Start reading the NEXT chunk immediately while we process the current one
+                const nextOffset = offset + CHUNK_SIZE;
+                if (nextOffset < file.size) {
+                    nextChunkPromise = readChunk(nextOffset);
+                }
+
+                // Construct Binary Packet: [ID_LEN (1)][ID BYTES][OFFSET (8)][DATA]
+                const headerSize = 1 + idBytes.length + 8;
+                const packet = new Uint8Array(headerSize + chunkData.length);
+                const view = new DataView(packet.buffer);
+
+                packet[0] = idBytes.length;
+                packet.set(idBytes, 1);
+                view.setBigUint64(1 + idBytes.length, BigInt(offset));
+                packet.set(chunkData, headerSize);
+
+                // This can throw if connection is closed
+                conn.send(packet);
+
+                offset += chunkData.length;
                 
-                // Calculate accurate progress: (Sent - Buffered) / Total
-                // This accounts for data still queued in the browser
-                const buffered = dataChannel?.bufferedAmount || 0;
-                const actualBytesSent = Math.max(0, offset - buffered);
-                const progress = Math.min(100, (actualBytesSent / file.size) * 100);
-                
-                setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
+                const now = Date.now();
+                if (now - lastUiUpdate > UI_UPDATE_INTERVAL || offset >= file.size) {
+                    lastUiUpdate = now;
+                    const buffered = dataChannel?.bufferedAmount || 0;
+                    // Note: bufferedAmount might include data from previous chunks, but this is a good enough approx
+                    const actualBytesSent = Math.max(0, offset - buffered);
+                    const progress = Math.min(100, (actualBytesSent / file.size) * 100);
+                    
+                    setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
+                }
             }
+        } catch (e) {
+            console.error("Transfer failed:", e);
+            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: -1 } : m));
+            addSystemMessage(`Transfer failed: ${file.name}`);
         }
     };
 
@@ -411,8 +446,9 @@ export const useWebRTC = () => {
             lastUpdate: 0,
             writable: null,
             fileHandle: null,
-            writeBuffer: [] as Uint8Array[], // Buffer for disk writes
+            writeBuffer: [] as Uint8Array[], 
             writeBufferSize: 0,
+            writeQueue: Promise.resolve(), // Serialization queue for writes
         };
 
         fileReceivers.current.set(data.id, receiver);
@@ -449,7 +485,6 @@ export const useWebRTC = () => {
                     .sort((a: any, b: any) => a[0] - b[0])
                     .map((entry: any) => entry[1]);
                 
-                // Initial flush doesn't need buffer, just write it
                 const blob = new Blob(sortedChunks);
                 await writable.write(blob);
                 receiver.chunks.clear();
@@ -507,16 +542,21 @@ export const useWebRTC = () => {
     const flushWriteBuffer = async (receiver: any) => {
         if (!receiver.writable || receiver.writeBuffer.length === 0) return;
 
-        try {
-            const blob = new Blob(receiver.writeBuffer);
-            await receiver.writable.write(blob);
-            // Clear buffer
-            receiver.writeBuffer = [];
-            receiver.writeBufferSize = 0;
-        } catch (err) {
-            console.error("Error flushing buffer", err);
-            addSystemMessage("Error writing to disk");
-        }
+        // 1. Swap buffer immediately to avoid race conditions with incoming chunks
+        const chunksToWrite = [...receiver.writeBuffer];
+        receiver.writeBuffer = [];
+        receiver.writeBufferSize = 0;
+
+        // 2. Schedule write in the queue
+        receiver.writeQueue = receiver.writeQueue.then(async () => {
+            try {
+                const blob = new Blob(chunksToWrite);
+                await receiver.writable.write(blob);
+            } catch (err) {
+                console.error("Error writing to disk", err);
+                addSystemMessage("Error writing to disk - file may be corrupt");
+            }
+        });
     };
 
     const handleFileChunk = async (data: FileChunkData) => {
@@ -562,6 +602,8 @@ export const useWebRTC = () => {
             try {
                 // Flush remaining buffer
                 await flushWriteBuffer(receiver);
+                // Wait for all writes to finish
+                await receiver.writeQueue;
                 
                 await receiver.writable.close();
                 const file = await receiver.fileHandle.getFile();

@@ -1,6 +1,7 @@
+
 import React, { useEffect, useRef } from 'react';
 import { Message, FileMetadata } from '../types';
-import { Download, File as FileIcon, Eye, HardDrive, Save, CornerDownLeft, Terminal } from 'lucide-react';
+import { Download, File as FileIcon, Eye, HardDrive, Save, CornerDownLeft, Terminal, AlertTriangle } from 'lucide-react';
 
 interface ChatAreaProps {
   messages: Message[];
@@ -104,8 +105,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onAcceptFile, onSa
                         </div>
                     </div>
 
+                    {/* FAILED STATE */}
+                    {msg.progress === -1 && (
+                        <div className="w-full mb-3 bg-red-900/20 border border-red-500/50 p-2 flex items-center gap-2 text-red-500">
+                             <AlertTriangle size={16} />
+                             <span className="text-xs font-bold font-mono tracking-wider">TRANSMISSION FAILED</span>
+                        </div>
+                    )}
+
                     {/* Progress Bar - Tactical Style */}
-                    {(msg.progress !== undefined && msg.progress < 100) && (
+                    {(msg.progress !== undefined && msg.progress >= 0 && msg.progress < 100) && (
                         <div className="w-full mb-3">
                             <div className="flex justify-between text-[10px] font-mono text-gray-400 mb-1">
                                 <span>TRANSMITTING...</span>
@@ -123,7 +132,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onAcceptFile, onSa
                     )}
 
                     {/* Save Action (During Transfer) */}
-                    {msg.needsAcceptance && !isMe && (
+                    {msg.needsAcceptance && !isMe && msg.progress !== -1 && (
                         <button
                             onClick={() => onAcceptFile(msg.id)}
                             className="w-full mb-2 flex items-center justify-center gap-2 px-4 py-2 bg-app-accent hover:bg-[#ff7518] text-black text-xs font-bold uppercase tracking-wider transition-colors hover:shadow-[0_0_15px_rgba(255,101,0,0.3)]"
