@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
 import { Message, FileMetadata, FileChunkData, TextData, FileMetaData } from '../types';
 
-const CHUNK_SIZE = 64 * 1024; // 64KB
+const CHUNK_SIZE = 256 * 1024; // 256KB
 const MAX_BUFFERED_AMOUNT = 16 * 1024 * 1024; // 16MB
 const UI_UPDATE_INTERVAL = 200; // ms
 
@@ -39,7 +39,7 @@ export const useWebRTC = () => {
     const [activeCall, setActiveCall] = useState<MediaConnection | null>(null);
     const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-    const [isCalling, setIsCalling] = useState(false); // Outgoing call state
+    const [isCalling, setIsCalling] = useState(false);
 
     const peerRef = useRef<Peer | null>(null);
     const connRef = useRef<DataConnection | null>(null);
@@ -61,7 +61,6 @@ export const useWebRTC = () => {
         });
     }, [addMessage]);
 
-    // Helper for legacy download (fallback)
     const triggerLegacyDownload = (url: string, name: string) => {
         const a = document.createElement('a');
         a.href = url;
@@ -97,7 +96,6 @@ export const useWebRTC = () => {
                 addSystemMessage(`Connected to peer: ${conn.peer}`);
             });
 
-            // Handle Incoming Calls
             peer.on('call', (call) => {
                 setIncomingCall(call);
             });
@@ -117,14 +115,18 @@ export const useWebRTC = () => {
         initPeer();
 
         return () => {
-            endCall(); // Cleanup active calls
+            endCall();
             peerRef.current?.destroy();
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const setupConnection = (conn: DataConnection) => {
         conn.on('data', async (data: any) => {
+            if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+                handleBinaryChunk(data);
+                return;
+            }
+
             if (data.type === 'text') {
                 addMessage({
                     id: Math.random().toString(36),
@@ -151,6 +153,30 @@ export const useWebRTC = () => {
 
         conn.on('error', (err) => {
             addSystemMessage(`Connection error: ${err.message}`);
+        });
+    };
+
+    const handleBinaryChunk = async (data: ArrayBuffer | Uint8Array) => {
+        const buffer = data instanceof Uint8Array ? data.buffer : data;
+        const array = new Uint8Array(buffer); // Zero-copy view
+        const view = new DataView(buffer);
+
+        // Parse Header
+        const idLen = array[0];
+        const idBytes = array.subarray(1, 1 + idLen); // subarray is faster than slice
+        const id = new TextDecoder().decode(idBytes);
+        
+        const offset = Number(view.getBigUint64(1 + idLen));
+        
+        const headerSize = 1 + idLen + 8;
+        const chunk = array.subarray(headerSize);
+
+        handleFileChunk({
+            id,
+            offset,
+            chunk,
+            type: 'file-chunk',
+            size: 0 
         });
     };
 
@@ -182,7 +208,6 @@ export const useWebRTC = () => {
         
         try {
             setIsCalling(true);
-            // This is the specific line that triggers the permission prompt
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             setLocalStream(stream);
 
@@ -203,7 +228,6 @@ export const useWebRTC = () => {
         if (!incomingCall) return;
 
         try {
-            // Triggers permission prompt for the receiver
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             setLocalStream(stream);
             
@@ -245,7 +269,7 @@ export const useWebRTC = () => {
 
     const setupCallEvents = (call: MediaConnection) => {
         setActiveCall(call);
-        setIsCalling(false); // Call established
+        setIsCalling(false); 
 
         call.on('stream', (stream) => {
             setRemoteStream(stream);
@@ -311,19 +335,17 @@ export const useWebRTC = () => {
 
         let offset = 0;
         let lastUiUpdate = 0;
-        const dataChannel = conn.dataChannel as any; // Cast to any to avoid type issues with PeerJS vs standard WebRTC types
+        const dataChannel = conn.dataChannel as any;
+
+        const idBytes = new TextEncoder().encode(fileId);
         
-        // Try to set low threshold for smoother backpressure
         try {
             if (dataChannel && 'bufferedAmountLowThreshold' in dataChannel) {
                 dataChannel.bufferedAmountLowThreshold = 64 * 1024; 
             }
-        } catch (e) {
-            // Ignore if property setting fails
-        }
+        } catch (e) { }
 
         while (offset < file.size) {
-            // Backpressure Control: Wait if buffer is full
             if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                 await new Promise<void>(resolve => {
                     const onLowBuffer = () => {
@@ -332,7 +354,6 @@ export const useWebRTC = () => {
                     };
                     dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
                     
-                    // Fail-safe / Polling fallback
                     const checkInterval = setInterval(() => {
                         if (dataChannel.bufferedAmount <= MAX_BUFFERED_AMOUNT / 2) {
                              dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
@@ -345,26 +366,33 @@ export const useWebRTC = () => {
 
             const chunk = file.slice(offset, offset + CHUNK_SIZE);
             const buffer = await chunk.arrayBuffer();
-            
-            conn.send({
-                type: 'file-chunk',
-                id: fileId,
-                chunk: new Uint8Array(buffer),
-                offset,
-                size: file.size
-            });
+            const chunkData = new Uint8Array(buffer);
+
+            // Construct Binary Packet: [ID_LEN (1)][ID BYTES][OFFSET (8)][DATA]
+            const headerSize = 1 + idBytes.length + 8;
+            const packet = new Uint8Array(headerSize + chunkData.length);
+            const view = new DataView(packet.buffer);
+
+            packet[0] = idBytes.length;
+            packet.set(idBytes, 1);
+            view.setBigUint64(1 + idBytes.length, BigInt(offset));
+            packet.set(chunkData, headerSize);
+
+            conn.send(packet);
 
             offset += CHUNK_SIZE;
             
-            // Throttled UI Updates
             const now = Date.now();
             if (now - lastUiUpdate > UI_UPDATE_INTERVAL || offset >= file.size) {
                 lastUiUpdate = now;
-                const progress = Math.min(100, (offset / file.size) * 100);
-                setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
                 
-                // Minimal yield to allow UI rendering
-                await new Promise(r => setTimeout(r, 0)); 
+                // Calculate accurate progress: (Sent - Buffered) / Total
+                // This accounts for data still queued in the browser
+                const buffered = dataChannel?.bufferedAmount || 0;
+                const actualBytesSent = Math.max(0, offset - buffered);
+                const progress = Math.min(100, (actualBytesSent / file.size) * 100);
+                
+                setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress } : m));
             }
         }
     };
@@ -381,13 +409,14 @@ export const useWebRTC = () => {
             chunks: new Map<number, Uint8Array>(),
             receivedChunks: new Set<number>(),
             lastUpdate: 0,
-            writable: null, // For disk streaming
+            writable: null,
             fileHandle: null,
+            writeBuffer: [] as Uint8Array[], // Buffer for disk writes
+            writeBufferSize: 0,
         };
 
         fileReceivers.current.set(data.id, receiver);
 
-        // Check if environment likely supports FSA (not perfect, but a first check)
         const supportsFSA = 'showSaveFilePicker' in window;
 
         addMessage({
@@ -406,7 +435,6 @@ export const useWebRTC = () => {
         if (!receiver) return;
 
         try {
-            // Attempt to show the file picker
             const handle = await window.showSaveFilePicker({
                 suggestedName: receiver.name
             });
@@ -415,49 +443,37 @@ export const useWebRTC = () => {
             receiver.fileHandle = handle;
             receiver.writable = writable;
 
-            // Flush existing memory buffer to disk
+            // Flush any chunks received before acceptance
             if (receiver.chunks.size > 0) {
                 const sortedChunks = Array.from(receiver.chunks.entries())
                     .sort((a: any, b: any) => a[0] - b[0])
                     .map((entry: any) => entry[1]);
                 
-                for (const chunk of sortedChunks) {
-                    await writable.write(chunk);
-                }
-                
-                // Free RAM!
+                // Initial flush doesn't need buffer, just write it
+                const blob = new Blob(sortedChunks);
+                await writable.write(blob);
                 receiver.chunks.clear();
             }
 
-            // Update UI to remove the accept button
             setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
 
-            // If the transfer was already finished in RAM before we accepted, close it now
             if (receiver.receivedBytes >= receiver.size) {
                 finishFileReceive(receiver);
             }
 
         } catch (err: any) {
-            // Remove the prompt button regardless of error type to prevent stuck state
             setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
 
-            // Handle SecurityError/Cross-Origin (iframe restrictions)
             if (err.name === 'SecurityError' || (err.message && err.message.includes('Cross origin'))) {
                 addSystemMessage("⚠️ Direct Disk Access is blocked in this preview window. Using RAM instead.");
-                addSystemMessage("ℹ️ To stream directly to disk (unlimited size), open this app in a full browser tab.");
             } else if (err.name !== 'AbortError') {
-                 // Other errors
                  console.error('File save init failed:', err);
                  addSystemMessage(`Stream setup failed: ${err.message}. Buffering in RAM.`);
             }
-            
-            // Note: We do NOT stop the transfer. We just fall back to the default RAM behavior 
-            // because 'receiver.writable' remains null.
         }
     };
 
     const saveFileToDisk = async (blobUrl: string, fileName: string) => {
-        // Fallback for browsers without FSA
         if (!('showSaveFilePicker' in window)) {
             triggerLegacyDownload(blobUrl, fileName);
             return;
@@ -477,18 +493,29 @@ export const useWebRTC = () => {
             
             addSystemMessage(`Saved ${fileName} to disk`);
         } catch (err: any) {
-             // If aborted by user, do nothing
              if (err.name === 'AbortError') return;
 
              console.warn('FSA Save failed, falling back to legacy download:', err);
              
-             // Specific handling for iframe/preview environment
              if (err.name === 'SecurityError' || (err.message && err.message.includes('Cross origin'))) {
                  addSystemMessage("⚠️ Save to Folder blocked in Preview. Downloading to default folder.");
              }
-             
-             // Fallback to standard download if FSA fails
              triggerLegacyDownload(blobUrl, fileName);
+        }
+    };
+
+    const flushWriteBuffer = async (receiver: any) => {
+        if (!receiver.writable || receiver.writeBuffer.length === 0) return;
+
+        try {
+            const blob = new Blob(receiver.writeBuffer);
+            await receiver.writable.write(blob);
+            // Clear buffer
+            receiver.writeBuffer = [];
+            receiver.writeBufferSize = 0;
+        } catch (err) {
+            console.error("Error flushing buffer", err);
+            addSystemMessage("Error writing to disk");
         }
     };
 
@@ -500,8 +527,14 @@ export const useWebRTC = () => {
             receiver.receivedChunks.add(data.offset);
             
             if (receiver.writable) {
-                // Write directly to disk
-                await receiver.writable.write(data.chunk);
+                // Buffer writes to disk for speed
+                receiver.writeBuffer.push(data.chunk);
+                receiver.writeBufferSize += data.chunk.byteLength;
+
+                // Flush if buffer > 16MB
+                if (receiver.writeBufferSize >= MAX_BUFFERED_AMOUNT) {
+                    await flushWriteBuffer(receiver);
+                }
             } else {
                 // Buffer in RAM (Fallback)
                 receiver.chunks.set(data.offset, data.chunk);
@@ -510,7 +543,6 @@ export const useWebRTC = () => {
             receiver.receivedBytes += data.chunk.byteLength;
         }
 
-        // Throttled receiver updates
         const now = Date.now();
         if (receiver.receivedBytes >= receiver.size || (now - receiver.lastUpdate > UI_UPDATE_INTERVAL)) {
             receiver.lastUpdate = now;
@@ -527,10 +559,11 @@ export const useWebRTC = () => {
         let url;
 
         if (receiver.writable) {
-            // Close the file stream
             try {
+                // Flush remaining buffer
+                await flushWriteBuffer(receiver);
+                
                 await receiver.writable.close();
-                // Get the file back from the handle to create a preview URL
                 const file = await receiver.fileHandle.getFile();
                 const type = receiver.mimeType || getFallbackMimeType(receiver.name);
                 const typedFile = file.slice(0, file.size, type);
@@ -540,7 +573,6 @@ export const useWebRTC = () => {
                 console.error("Error closing file stream", e);
             }
         } else {
-            // Memory Fallback
             const sortedChunks = Array.from(receiver.chunks.entries())
                 .sort((a: any, b: any) => a[0] - b[0])
                 .map((entry: any) => entry[1]);
@@ -571,7 +603,6 @@ export const useWebRTC = () => {
         sendFile,
         acceptFileTransfer,
         saveFileToDisk,
-        // Call exports
         startCall,
         answerCall,
         rejectCall,
