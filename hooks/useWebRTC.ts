@@ -347,17 +347,91 @@ export const useWebRTC = () => {
         });
     };
 
-    const sendFile = async (file: File) => {
-        if (!connectedPeerId || !peerRef.current) return;
+    const activeTransferRefs = useRef<Map<string, {
+        file: File,
+        offset: number,
+        idBytes: Uint8Array,
+        lastUiUpdate: number
+    }>>(new Map());
+    const isLoopRunning = useRef(false);
+
+    const runTransferLoop = useCallback(async () => {
+        if (isLoopRunning.current) return;
+        isLoopRunning.current = true;
+
+        while (activeTransferRefs.current.size > 0) {
+            const conn = connRef.current;
+            if (!conn || !conn.open) {
+                activeTransferRefs.current.forEach((_, id) => {
+                    setMessages(prev => prev.map(m => m.id === id ? { ...m, progress: -1 } : m));
+                });
+                activeTransferRefs.current.clear();
+                break;
+            }
+
+            const dataChannel = conn.dataChannel as any;
+            if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+                await new Promise<void>(resolve => {
+                    const onLow = () => {
+                        dataChannel.removeEventListener('bufferedamountlow', onLow);
+                        resolve();
+                    };
+                    dataChannel.addEventListener('bufferedamountlow', onLow);
+                    setTimeout(resolve, 50);
+                });
+                continue;
+            }
+
+            // Round-robin one chunk for each file
+            for (const [id, state] of Array.from(activeTransferRefs.current.entries())) {
+                try {
+                    const chunkDataBuffer = await state.file.slice(state.offset, state.offset + CHUNK_SIZE).arrayBuffer();
+                    const chunkData = new Uint8Array(chunkDataBuffer);
+
+                    const headerSize = 1 + state.idBytes.length + 8;
+                    const packet = new Uint8Array(headerSize + chunkData.length);
+                    const view = new DataView(packet.buffer);
+
+                    packet[0] = state.idBytes.length;
+                    packet.set(state.idBytes, 1);
+                    view.setBigUint64(1 + state.idBytes.length, BigInt(state.offset));
+                    packet.set(chunkData, headerSize);
+
+                    conn.send(packet);
+                    state.offset += chunkData.length;
+
+                    const now = Date.now();
+                    if (now - state.lastUiUpdate > UI_UPDATE_INTERVAL || state.offset >= state.file.size) {
+                        state.lastUiUpdate = now;
+                        const progress = Math.min(100, (state.offset / state.file.size) * 100);
+                        setMessages(prev => prev.map(m => m.id === id ? { ...m, progress } : m));
+                    }
+
+                    if (state.offset >= state.file.size) {
+                        activeTransferRefs.current.delete(id);
+                    }
+                } catch (e) {
+                    console.error("Transfer error for", id, e);
+                    activeTransferRefs.current.delete(id);
+                    setMessages(prev => prev.map(m => m.id === id ? { ...m, progress: -1 } : m));
+                }
+
+                if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) break;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 10)); // Yield to CPU
+        }
+        isLoopRunning.current = false;
+    }, [setMessages]);
+
+    const sendFile = useCallback((file: File) => {
+        if (!connRef.current?.open) {
+            addSystemMessage('Not connected');
+            return;
+        }
 
         const fileId = Math.random().toString(36).substring(2);
-
-        // Open dedicated side-channel for this file transfer
-        const conn = peerRef.current.connect(connectedPeerId, {
-            label: 'file-transfer',
-            reliable: true,
-            serialization: 'binary'
-        });
+        const idBytes = new TextEncoder().encode(fileId);
 
         addMessage({
             id: fileId,
@@ -368,122 +442,24 @@ export const useWebRTC = () => {
             progress: 0
         });
 
-        try {
-            // Wait for side-channel to open
-            await new Promise<void>((resolve, reject) => {
-                const onOpen = () => {
-                    cleanup();
-                    resolve();
-                };
-                const onError = (err: any) => {
-                    cleanup();
-                    reject(err);
-                };
-                const cleanup = () => {
-                    conn.off('open', onOpen);
-                    conn.off('error', onError);
-                };
-                conn.on('open', onOpen);
-                conn.on('error', onError);
-                setTimeout(() => {
-                    cleanup();
-                    reject(new Error("Connection timeout"));
-                }, 15000);
-            });
+        connRef.current.send({
+            type: 'file-meta',
+            id: fileId,
+            name: file.name,
+            size: file.size,
+            chunkSize: CHUNK_SIZE,
+            mimeType: file.type || getFallbackMimeType(file.name)
+        } as FileMetaData);
 
-            conn.send({
-                type: 'file-meta',
-                id: fileId,
-                name: file.name,
-                size: file.size,
-                chunkSize: CHUNK_SIZE,
-                mimeType: file.type || getFallbackMimeType(file.name)
-            } as FileMetaData);
+        activeTransferRefs.current.set(fileId, {
+            file,
+            offset: 0,
+            idBytes,
+            lastUiUpdate: Date.now()
+        });
 
-            let offset = 0;
-            let lastUiUpdate = 0;
-            const dataChannel = conn.dataChannel as any;
-            const idBytes = new TextEncoder().encode(fileId);
-
-            if (dataChannel && 'bufferedAmountLowThreshold' in dataChannel) {
-                // Set threshold to 512KB for a healthy data pipeline
-                dataChannel.bufferedAmountLowThreshold = 512 * 1024;
-            }
-
-            const readChunk = async (start: number): Promise<Uint8Array> => {
-                const chunk = file.slice(start, start + CHUNK_SIZE);
-                const buffer = await chunk.arrayBuffer();
-                return new Uint8Array(buffer);
-            };
-
-            let nextChunkPromise = readChunk(0);
-            const progressRef = { lastReported: 0 };
-
-            while (offset < file.size) {
-                if (!conn.open) throw new Error("Connection closed during transfer");
-
-                if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                    await new Promise<void>((resolve, reject) => {
-                        const onLowBuffer = () => {
-                            dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
-                            resolve();
-                        };
-                        dataChannel.addEventListener('bufferedamountlow', onLowBuffer);
-
-                        const checkInterval = setInterval(() => {
-                            if (!conn.open) {
-                                clearInterval(checkInterval);
-                                dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
-                                reject(new Error("Connection closed"));
-                                return;
-                            }
-                            if (dataChannel.bufferedAmount <= BACKPRESSURE_RESUME_THRESHOLD) {
-                                dataChannel.removeEventListener('bufferedamountlow', onLowBuffer);
-                                clearInterval(checkInterval);
-                                resolve();
-                            }
-                        }, 50);
-                    });
-                }
-
-                const chunkData = await nextChunkPromise;
-                const nextOffset = offset + CHUNK_SIZE;
-                if (nextOffset < file.size) {
-                    nextChunkPromise = readChunk(nextOffset);
-                }
-
-                const headerSize = 1 + idBytes.length + 8;
-                const packet = new Uint8Array(headerSize + chunkData.length);
-                const view = new DataView(packet.buffer);
-
-                packet[0] = idBytes.length;
-                packet.set(idBytes, 1);
-                view.setBigUint64(1 + idBytes.length, BigInt(offset));
-                packet.set(chunkData, headerSize);
-
-                conn.send(packet);
-                offset += chunkData.length;
-
-                const now = Date.now();
-                const currentProgress = Math.min(100, (offset / file.size) * 100);
-
-                // Only update UI if enough time passed AND progress changed significantly
-                if ((now - lastUiUpdate > UI_UPDATE_INTERVAL && currentProgress - progressRef.lastReported >= 1) || offset >= file.size) {
-                    lastUiUpdate = now;
-                    progressRef.lastReported = currentProgress;
-
-                    setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: currentProgress } : m));
-                }
-            }
-
-            // Ensure 100% is set at the end
-            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: 100 } : m));
-        } catch (e) {
-            console.error("Transfer failed:", e);
-            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, progress: -1 } : m));
-            addSystemMessage(`Transfer failed: ${file.name}`);
-        }
-    };
+        runTransferLoop();
+    }, [addMessage, runTransferLoop, addSystemMessage]);
 
     const handleFileMeta = (data: FileMetaData) => {
         addSystemMessage(`Receiving ${data.name}...`);

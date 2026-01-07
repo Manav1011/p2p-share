@@ -6,7 +6,7 @@ import { InputArea } from './components/InputArea';
 import { QRModal } from './components/QRModal';
 import { CallInterface } from './components/CallInterface';
 import { parseMarkdown } from './utils/markdown';
-import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone } from 'lucide-react';
+import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download } from 'lucide-react';
 
 const App: React.FC = () => {
     const {
@@ -105,6 +105,26 @@ const App: React.FC = () => {
         }
     };
 
+    const downloadAllFiles = () => {
+        const fileMessages = messages.filter(m => m.type === 'file' && m.blobUrl);
+        if (fileMessages.length === 0) {
+            alert("No files available for download yet.");
+            return;
+        }
+
+        fileMessages.forEach((msg, index) => {
+            // Slight delay to prevent browser download blocking
+            setTimeout(() => {
+                const link = document.createElement('a');
+                link.href = msg.blobUrl!;
+                link.download = (msg.content as any).name;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }, index * 200);
+        });
+    };
+
     return (
         <div
             className="h-full w-full flex flex-col items-center bg-app-bg text-[#e0e0e0] relative scanlines"
@@ -184,6 +204,16 @@ const App: React.FC = () => {
                                         title="Initiate Voice Link"
                                     >
                                         <Phone size={16} className="sm:w-[18px] sm:h-[18px]" />
+                                    </button>
+                                )}
+
+                                {connectionStatus === 'connected' && (
+                                    <button
+                                        onClick={downloadAllFiles}
+                                        className="bg-white/5 hover:bg-app-accent hover:text-black border border-white/10 text-gray-300 p-1.5 sm:p-2 transition-all duration-200 group rounded-sm"
+                                        title="Download All Received Files"
+                                    >
+                                        <Download size={16} className="sm:w-[18px] sm:h-[18px]" />
                                     </button>
                                 )}
 
