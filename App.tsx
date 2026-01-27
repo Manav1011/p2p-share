@@ -6,15 +6,25 @@ import { InputArea } from './components/InputArea';
 import { QRModal } from './components/QRModal';
 import { CallInterface } from './components/CallInterface';
 import { parseMarkdown } from './utils/markdown';
-import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download } from 'lucide-react';
+import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download, Users } from 'lucide-react';
+import { LoginOverlay } from './components/LoginOverlay';
+import { UserList } from './components/UserList';
 
 const App: React.FC = () => {
+
+    const [username, setUsername] = useState<string | null>(() => {
+        return localStorage.getItem('p2p_username');
+    });
+    const [showLogin, setShowLogin] = useState(false);
+    const [showUserList, setShowUserList] = useState(false);
+
     const {
         myPeerId,
         connectionStatus,
         connectedPeerId,
         messages,
         connectToPeer,
+        disconnectPeer,
         sendText,
         sendFile,
         acceptFileTransfer,
@@ -29,12 +39,35 @@ const App: React.FC = () => {
         activeCall,
         remoteStream,
         localStream
-    } = useWebRTC();
+    } = useWebRTC(username);
 
-    const [showQR, setShowQR] = useState(true);
+    // Heartbeat Effect
+    useEffect(() => {
+        if (!username) return;
+
+        const ping = async () => {
+            try {
+                const res = await fetch(`/api/ping?username=${username}`, { method: 'POST' });
+                if (res.status === 404) {
+                    console.warn("Session expired or invalid, logging out");
+                    setUsername(null);
+                    localStorage.removeItem('p2p_username');
+                }
+            } catch (e) {
+                console.error("Ping failed", e);
+            }
+        };
+
+        ping(); // Initial
+        const interval = setInterval(ping, 30000); // 30s heartbeat
+        return () => clearInterval(interval);
+    }, [username]);
+
+    const [showQR, setShowQR] = useState(false); // Default false now
     const [isDragging, setIsDragging] = useState(false);
     const dragCounter = React.useRef(0);
 
+    // ... (keep drag handlers same) ...
     useEffect(() => {
         // Auto-hide QR only on initial connection transition
         if (connectionStatus === 'connected' && showQR) {
@@ -133,6 +166,28 @@ const App: React.FC = () => {
             onDragOver={handleDragOver}
             onDrop={handleDrop}
         >
+            {showLogin && (
+                <LoginOverlay
+                    onLogin={(name) => {
+                        setUsername(name);
+                        localStorage.setItem('p2p_username', name);
+                        setShowLogin(false);
+                    }}
+                    onClose={() => setShowLogin(false)}
+                />
+            )}
+
+            {showUserList && username && (
+                <UserList
+                    currentUsername={username}
+                    onConnect={(target) => {
+                        connectToPeer(target);
+                        setShowUserList(false);
+                    }}
+                    onClose={() => setShowUserList(false)}
+                />
+            )}
+
             {/* Tactical Drag Overlay */}
             {isDragging && (
                 <div className="absolute inset-0 z-[60] bg-app-accent/10 border-[8px] border-app-accent backdrop-blur-sm flex flex-col items-center justify-center pointer-events-none">
@@ -155,7 +210,7 @@ const App: React.FC = () => {
             )}
 
             {/* Main Container */}
-            <div className="w-full max-w-5xl h-full flex flex-col gap-0 border-x border-white/5 bg-black/40 shadow-2xl relative">
+            <div className={`w-full max-w-5xl h-full flex flex-col gap-0 border-x border-white/5 bg-black/40 shadow-2xl relative transition-opacity duration-500 opacity-100`}>
 
                 {/* Tactical Header / HUD */}
                 <div className="shrink-0 bg-[#151515] border-b border-white/10 p-0 flex flex-col relative overflow-hidden z-50">
@@ -165,7 +220,7 @@ const App: React.FC = () => {
                     <div className="p-3 sm:p-4 flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2 sm:gap-3 overflow-hidden">
                             <div className="bg-app-accent text-black font-bold px-1.5 py-0.5 text-[10px] sm:text-xs tracking-widest uppercase shrink-0">
-                                EPISODE 1
+                                EPISODE 2
                             </div>
                             <h1 className="text-white text-sm sm:text-lg font-bold tracking-tight uppercase truncate">
                                 P2P Share <span className="hidden sm:inline text-gray-500 font-normal mx-2">//</span> <span className="hidden sm:inline">SECURE UPLINK</span>
@@ -175,7 +230,31 @@ const App: React.FC = () => {
                         <div className="flex items-center gap-3 sm:gap-6 text-xs font-mono shrink-0">
                             <div className="hidden sm:flex flex-col items-end">
                                 <span className="text-gray-500 uppercase tracking-wider text-[10px]">Your Call Sign</span>
-                                <span className="text-app-accent">{myPeerId || 'INITIALIZING...'}</span>
+                                <div className="flex items-center gap-2">
+                                    <span className="text-app-accent">{myPeerId || 'INITIALIZING...'}</span>
+                                    {!username ? (
+                                        <button
+                                            onClick={() => setShowLogin(true)}
+                                            className="text-[10px] bg-white/10 hover:bg-white/20 px-1.5 py-0.5 rounded text-gray-300 uppercase transition-colors"
+                                        >
+                                            Login
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={() => {
+                                                if (confirm("Disconnect and Logout?")) {
+                                                    setUsername(null);
+                                                    localStorage.removeItem('p2p_username');
+                                                    // Optional: Reload to force clean state
+                                                    // window.location.reload(); 
+                                                }
+                                            }}
+                                            className="text-[10px] bg-red-900/30 hover:bg-red-900/50 px-1.5 py-0.5 rounded text-red-400 border border-red-900/50 uppercase transition-colors"
+                                        >
+                                            Logout
+                                        </button>
+                                    )}
+                                </div>
                             </div>
 
                             <div className="h-8 w-px bg-white/10 hidden sm:block"></div>
@@ -196,6 +275,17 @@ const App: React.FC = () => {
                             </div>
 
                             <div className="flex gap-1.5 sm:gap-2">
+                                {/* Connect Button */}
+                                {connectionStatus !== 'connected' && (
+                                    <button
+                                        onClick={() => setShowUserList(true)}
+                                        className="bg-app-accent/10 hover:bg-app-accent hover:text-black border border-app-accent/50 text-app-accent p-1.5 sm:p-2 transition-all duration-200 group rounded-sm animate-pulse"
+                                        title="Scan for Peers"
+                                    >
+                                        <Users size={16} className="sm:w-[18px] sm:h-[18px]" />
+                                    </button>
+                                )}
+
                                 {/* Call Button */}
                                 {connectionStatus === 'connected' && !activeCall && !isCalling && (
                                     <button
@@ -204,6 +294,16 @@ const App: React.FC = () => {
                                         title="Initiate Voice Link"
                                     >
                                         <Phone size={16} className="sm:w-[18px] sm:h-[18px]" />
+                                    </button>
+                                )}
+
+                                {connectionStatus === 'connected' && (
+                                    <button
+                                        onClick={disconnectPeer}
+                                        className="bg-red-900/20 hover:bg-red-600 hover:text-white border border-red-900/50 text-red-500 p-1.5 sm:p-2 transition-all duration-200 group rounded-sm"
+                                        title="Disconnect Link"
+                                    >
+                                        <Radio size={16} className="sm:w-[18px] sm:h-[18px]" />
                                     </button>
                                 )}
 
@@ -234,7 +334,7 @@ const App: React.FC = () => {
                             <span className="shrink-0">Encrypted: {connectionStatus === 'connected' ? <ShieldCheck size={10} className="inline text-app-accent mb-0.5" /> : <ShieldAlert size={10} className="inline mb-0.5" />}</span>
                             {connectedPeerId && <span className="hidden sm:inline truncate">Target: {connectedPeerId}</span>}
                         </div>
-                        <div className="shrink-0">SYS.VER.2.0.4</div>
+                        <div className="shrink-0">SYS.VER.2.1.0</div>
                     </div>
                 </div>
 

@@ -28,7 +28,18 @@ const getFallbackMimeType = (name: string) => {
     }
 };
 
-export const useWebRTC = () => {
+// Status API helpers
+const updateStatus = async (username: string, isBusy: boolean) => {
+    try {
+        await fetch('/api/status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, is_busy: isBusy })
+        });
+    } catch (e) { console.error("Status update failed", e); }
+};
+
+export const useWebRTC = (currentUsername: string | null) => {
     const [myPeerId, setMyPeerId] = useState<string>('');
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
     const [messages, setMessages] = useState<Message[]>([]);
@@ -46,6 +57,7 @@ export const useWebRTC = () => {
 
     // File Transfer Refs
     const fileReceivers = useRef<Map<string, any>>(new Map());
+    const retryCount = useRef(0);
 
     const addMessage = useCallback((msg: Message) => {
         setMessages(prev => [...prev, msg]);
@@ -72,8 +84,10 @@ export const useWebRTC = () => {
 
     useEffect(() => {
         const initPeer = async () => {
-            const randomId = Math.random().toString(36).substring(2, 6);
-            const peer = new Peer(randomId, {
+            // GUEST MODE: Generate random ID if no username
+            const peerId = currentUsername || Math.random().toString(36).substring(2, 6);
+
+            const peer = new Peer(peerId, {
                 debug: 2,
                 config: {
                     iceServers: [
@@ -89,17 +103,28 @@ export const useWebRTC = () => {
             peer.on('open', (id) => {
                 setMyPeerId(id);
                 addSystemMessage(`Your ID: ${id}`);
+                retryCount.current = 0;
             });
 
             peer.on('connection', (conn) => {
                 const isMain = conn.label !== 'file-transfer';
 
                 if (isMain) {
+                    // SINGLE CONNECTION GUARD
+                    if (connRef.current && connRef.current.open) {
+                        console.warn("Blocking incoming connection - Already connected");
+                        conn.close();
+                        return;
+                    }
+
                     connRef.current = conn;
                     setConnectionStatus('connected');
                     setConnectedPeerId(conn.peer);
                     addSystemMessage(`Connected to peer: ${conn.peer}`);
                     setupConnection(conn, true);
+
+                    // Mark as busy
+                    if (currentUsername) updateStatus(currentUsername, true);
                 } else {
                     setupConnection(conn, false);
                 }
@@ -111,12 +136,34 @@ export const useWebRTC = () => {
 
             peer.on('error', (err) => {
                 console.error('Peer error:', err.type, err);
+
                 if (err.type === 'peer-unavailable') {
                     addSystemMessage(`Peer ${connectedPeerId} not found.`);
+                    setConnectionStatus('disconnected');
+                    return;
                 }
+
+                if (err.type === 'unavailable-id') {
+                    if (retryCount.current < 5) {
+                        retryCount.current += 1;
+                        const delay = 2000 * retryCount.current;
+                        addSystemMessage(`⚠️ ID Active. Retrying cleanup (${retryCount.current}/5) in ${delay / 1000}s...`);
+
+                        setTimeout(() => {
+                            peer.destroy();
+                            initPeer();
+                        }, delay);
+                    } else {
+                        addSystemMessage("❌ ID Locked. Please close other tabs or wait 30s.");
+                        setConnectionStatus('disconnected');
+                    }
+                    return; // Early return to avoid generic error
+                }
+
                 if (err.type === 'disconnected') {
                     peer.reconnect();
                 }
+
                 setConnectionStatus('disconnected');
                 addSystemMessage(`Error: ${err.type}`);
             });
@@ -125,20 +172,28 @@ export const useWebRTC = () => {
                 setConnectionStatus('disconnected');
                 // Attempt to reconnect to signaling server if not destroyed
                 if (peer && !peer.destroyed) {
-                    peer.reconnect();
+                    // peer.reconnect(); // Can cause loops if completely dead
                 }
             });
 
             peerRef.current = peer;
         };
 
-        initPeer();
+        const timer = setTimeout(initPeer, 100); // Slight delay to allow cleanup
 
-        return () => {
+        const handleUnload = () => {
             endCall();
             peerRef.current?.destroy();
         };
-    }, []);
+        window.addEventListener('beforeunload', handleUnload);
+
+        return () => {
+            clearTimeout(timer);
+            window.removeEventListener('beforeunload', handleUnload);
+            endCall();
+            peerRef.current?.destroy();
+        };
+    }, [currentUsername, addSystemMessage]);
 
     const setupConnection = (conn: DataConnection, isMain: boolean = true) => {
         conn.on('data', (data: any) => {
@@ -170,6 +225,9 @@ export const useWebRTC = () => {
                 addSystemMessage('Peer disconnected');
                 connRef.current = null;
                 endCall();
+
+                // Mark as available
+                if (currentUsername) updateStatus(currentUsername, false);
             }
         });
 
@@ -230,12 +288,24 @@ export const useWebRTC = () => {
             setConnectedPeerId(peerId);
             setupConnection(conn);
             addSystemMessage(`Connected to ${peerId}`);
+            if (currentUsername) updateStatus(currentUsername, true);
         });
 
         conn.on('error', (err) => {
             setConnectionStatus('disconnected');
             addSystemMessage(`Failed to connect: ${err.message}`);
         });
+    };
+
+    const disconnectPeer = () => {
+        if (connRef.current) {
+            connRef.current.close();
+        }
+        setConnectionStatus('disconnected');
+        setConnectedPeerId('');
+        addSystemMessage('Disconnected manually');
+        connRef.current = null;
+        if (currentUsername) updateStatus(currentUsername, false);
     };
 
     // --- Voice Call Logic ---
@@ -680,6 +750,7 @@ export const useWebRTC = () => {
         connectedPeerId,
         messages,
         connectToPeer,
+        disconnectPeer,
         sendText,
         sendFile,
         acceptFileTransfer,
