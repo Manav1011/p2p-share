@@ -18,7 +18,8 @@ export const LoginOverlay: React.FC<LoginOverlayProps> = ({ onLogin, onClose }) 
         setError('');
         setLoading(true);
 
-        const endpoint = isRegistering ? '/api/register' : '/api/login';
+        const apiBase = import.meta.env.VITE_API_TARGET || '';
+        const endpoint = isRegistering ? `${apiBase}/register` : `${apiBase}/login`;
 
         try {
             const res = await fetch(endpoint, {

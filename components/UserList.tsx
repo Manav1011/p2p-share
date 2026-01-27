@@ -20,7 +20,8 @@ export const UserList: React.FC<UserListProps> = ({ currentUsername, onConnect, 
     const fetchUsers = async () => {
         setLoading(true);
         try {
-            const res = await fetch('/api/users');
+            const apiBase = import.meta.env.VITE_API_TARGET || '';
+            const res = await fetch(`${apiBase}/users`);
             if (res.ok) {
                 const data = await res.json();
                 // Filter out self

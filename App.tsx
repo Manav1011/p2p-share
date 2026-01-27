@@ -47,7 +47,8 @@ const App: React.FC = () => {
 
         const ping = async () => {
             try {
-                const res = await fetch(`/api/ping?username=${username}`, { method: 'POST' });
+                const apiBase = import.meta.env.VITE_API_TARGET || '';
+                const res = await fetch(`${apiBase}/ping?username=${username}`, { method: 'POST' });
                 if (res.status === 404) {
                     console.warn("Session expired or invalid, logging out");
                     setUsername(null);
@@ -228,8 +229,8 @@ const App: React.FC = () => {
                         </div>
 
                         <div className="flex items-center gap-3 sm:gap-6 text-xs font-mono shrink-0">
-                            <div className="hidden sm:flex flex-col items-end">
-                                <span className="text-gray-500 uppercase tracking-wider text-[10px]">Your Call Sign</span>
+                            <div className="flex flex-col items-end">
+                                <span className="hidden sm:block text-gray-500 uppercase tracking-wider text-[10px]">Your Call Sign</span>
                                 <div className="flex items-center gap-2">
                                     <span className="text-app-accent">{myPeerId || 'INITIALIZING...'}</span>
                                     {!username ? (

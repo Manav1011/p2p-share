@@ -31,7 +31,8 @@ const getFallbackMimeType = (name: string) => {
 // Status API helpers
 const updateStatus = async (username: string, isBusy: boolean) => {
     try {
-        await fetch('/api/status', {
+        const apiBase = import.meta.env.VITE_API_TARGET || '';
+        await fetch(`${apiBase}/status`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ username, is_busy: isBusy })
