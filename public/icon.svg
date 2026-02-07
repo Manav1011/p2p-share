@@ -1,0 +1,41 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background with a subtle gradient-like effect (simulated with multiple circles) -->
+  <rect width="512" height="512" rx="128" fill="#0A0A0A"/>
+  <circle cx="256" cy="256" r="240" fill="url(#paint0_radial)" fill-opacity="0.1"/>
+  
+  <!-- Outer glowing ring -->
+  <circle cx="256" cy="256" r="180" stroke="#FF6500" stroke-width="8" stroke-opacity="0.2"/>
+  
+  <!-- Central P2P Symbol -->
+  <g filter="url(#glow)">
+    <!-- Nodes -->
+    <circle cx="256" cy="140" r="24" fill="#FF6500"/>
+    <circle cx="150" cy="320" r="24" fill="#FF6500"/>
+    <circle cx="362" cy="320" r="24" fill="#FF6500"/>
+    
+    <!-- Connections -->
+    <path d="M256 164L165 305" stroke="#FF6500" stroke-width="12" stroke-linecap="round"/>
+    <path d="M256 164L347 305" stroke="#FF6500" stroke-width="12" stroke-linecap="round"/>
+    <path d="M174 320H338" stroke="#FF6500" stroke-width="12" stroke-linecap="round"/>
+    
+    <!-- Inner detail -->
+    <circle cx="256" cy="225" r="40" stroke="#FF6500" stroke-width="6" stroke-dasharray="8 8"/>
+  </g>
+
+  <defs>
+    <radialGradient id="paint0_radial" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" transform="translate(256 256) rotate(90) scale(240)">
+      <stop stop-color="#FF6500"/>
+      <stop offset="1" stop-color="#FF6500" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="0" y="0" width="512" height="512" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dx="0" dy="0"/>
+      <feGaussianBlur stdDeviation="15"/>
+      <feComposite in2="hardAlpha" operator="out"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 1 0 0 0 0 0.396 0 0 0 0 0 0 0 0 0.5 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow" result="shape"/>
+    </filter>
+  </defs>
+</svg>

@@ -6,7 +6,7 @@ import { InputArea } from './components/InputArea';
 import { QRModal } from './components/QRModal';
 import { CallInterface } from './components/CallInterface';
 import { parseMarkdown } from './utils/markdown';
-import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download, Users } from 'lucide-react';
+import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download, Users, Smartphone } from 'lucide-react';
 import { LoginOverlay } from './components/LoginOverlay';
 import { UserList } from './components/UserList';
 
@@ -17,6 +17,28 @@ const App: React.FC = () => {
     });
     const [showLogin, setShowLogin] = useState(false);
     const [showUserList, setShowUserList] = useState(false);
+
+    const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+    const [isInstallable, setIsInstallable] = useState(false);
+
+    useEffect(() => {
+        const handler = (e: any) => {
+            e.preventDefault();
+            setDeferredPrompt(e);
+            setIsInstallable(true);
+        };
+        window.addEventListener('beforeinstallprompt', handler);
+        return () => window.removeEventListener('beforeinstallprompt', handler);
+    }, []);
+
+    const handleInstallClick = async () => {
+        if (!deferredPrompt) return;
+        deferredPrompt.prompt();
+        const { outcome } = await deferredPrompt.userChoice;
+        if (outcome === 'accepted') {
+            setIsInstallable(false);
+        }
+    };
 
     const {
         myPeerId,
@@ -278,14 +300,26 @@ const App: React.FC = () => {
                             <div className="flex gap-1.5 sm:gap-2">
                                 {/* Connect Button */}
                                 {connectionStatus !== 'connected' && (
-                                    <button
-                                        onClick={() => setShowUserList(true)}
-                                        className="bg-app-accent/10 hover:bg-app-accent hover:text-black border border-app-accent/50 text-app-accent p-1.5 sm:p-2 transition-all duration-200 group rounded-sm animate-pulse"
-                                        title="Scan for Peers"
-                                    >
-                                        <Users size={16} className="sm:w-[18px] sm:h-[18px]" />
-                                    </button>
-                                )}
+                                        <button
+                                            onClick={() => setShowUserList(true)}
+                                            className="bg-app-accent/10 hover:bg-app-accent hover:text-black border border-app-accent/50 text-app-accent p-1.5 sm:p-2 transition-all duration-200 group rounded-sm animate-pulse"
+                                            title="Scan for Peers"
+                                        >
+                                            <Users size={16} className="sm:w-[18px] sm:h-[18px]" />
+                                        </button>
+                                    )}
+ 
+                                    {/* Install PWA Button */}
+                                    {isInstallable && (
+                                        <button
+                                            onClick={handleInstallClick}
+                                            className="bg-app-accent/20 hover:bg-app-accent hover:text-black border border-app-accent text-app-accent p-1.5 sm:p-2 transition-all duration-200 group rounded-sm flex items-center gap-2"
+                                            title="Install as App"
+                                        >
+                                            <Smartphone size={16} className="sm:w-[18px] sm:h-[18px]" />
+                                            <span className="hidden sm:inline text-[10px] font-bold">INSTALL</span>
+                                        </button>
+                                    )}
 
                                 {/* Call Button */}
                                 {connectionStatus === 'connected' && !activeCall && !isCalling && (
