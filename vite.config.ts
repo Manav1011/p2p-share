@@ -6,6 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
+    base: '/p2p-share/',
     plugins: [
       react(),
       VitePWA({
@@ -18,6 +19,8 @@ export default defineConfig(({ mode }) => {
           theme_color: '#0A0A0A',
           background_color: '#0A0A0A',
           display: 'standalone',
+          scope: '/p2p-share/',
+          start_url: '/p2p-share/',
           icons: [
             {
               src: 'icon.svg',
@@ -37,14 +40,7 @@ export default defineConfig(({ mode }) => {
     ],
     server: {
       host: '0.0.0.0',
-      port: 5173,
-      proxy: {
-        '/api': {
-          target: env.VITE_API_TARGET || 'http://localhost:8000',
-          changeOrigin: true,
-          rewrite: (path) => path.replace(/^\/api/, '')
-        }
-      }
+      port: 5173
     },
   }
 })

@@ -28,19 +28,7 @@ const getFallbackMimeType = (name: string) => {
     }
 };
 
-// Status API helpers
-const updateStatus = async (username: string, isBusy: boolean) => {
-    try {
-        const apiBase = import.meta.env.VITE_API_TARGET || '';
-        await fetch(`${apiBase}/status`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, is_busy: isBusy })
-        });
-    } catch (e) { console.error("Status update failed", e); }
-};
-
-export const useWebRTC = (currentUsername: string | null) => {
+export const useWebRTC = () => {
     const [myPeerId, setMyPeerId] = useState<string>('');
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
     const [messages, setMessages] = useState<Message[]>([]);
@@ -85,8 +73,8 @@ export const useWebRTC = (currentUsername: string | null) => {
 
     useEffect(() => {
         const initPeer = async () => {
-            // GUEST MODE: Generate random ID if no username
-            const peerId = currentUsername || Math.random().toString(36).substring(2, 6);
+            // GUEST MODE: Generate random ID
+            const peerId = Math.random().toString(36).substring(2, 6);
 
             const peer = new Peer(peerId, {
                 debug: 2,
@@ -123,9 +111,6 @@ export const useWebRTC = (currentUsername: string | null) => {
                     setConnectedPeerId(conn.peer);
                     addSystemMessage(`Connected to peer: ${conn.peer}`);
                     setupConnection(conn, true);
-
-                    // Mark as busy
-                    if (currentUsername) updateStatus(currentUsername, true);
                 } else {
                     setupConnection(conn, false);
                 }
@@ -194,7 +179,7 @@ export const useWebRTC = (currentUsername: string | null) => {
             endCall();
             peerRef.current?.destroy();
         };
-    }, [currentUsername, addSystemMessage]);
+    }, [addSystemMessage]);
 
     const setupConnection = (conn: DataConnection, isMain: boolean = true) => {
         conn.on('data', (data: any) => {
@@ -226,9 +211,6 @@ export const useWebRTC = (currentUsername: string | null) => {
                 addSystemMessage('Peer disconnected');
                 connRef.current = null;
                 endCall();
-
-                // Mark as available
-                if (currentUsername) updateStatus(currentUsername, false);
             }
         });
 
@@ -289,7 +271,6 @@ export const useWebRTC = (currentUsername: string | null) => {
             setConnectedPeerId(peerId);
             setupConnection(conn);
             addSystemMessage(`Connected to ${peerId}`);
-            if (currentUsername) updateStatus(currentUsername, true);
         });
 
         conn.on('error', (err) => {
@@ -306,7 +287,6 @@ export const useWebRTC = (currentUsername: string | null) => {
         setConnectedPeerId('');
         addSystemMessage('Disconnected manually');
         connRef.current = null;
-        if (currentUsername) updateStatus(currentUsername, false);
     };
 
     // --- Voice Call Logic ---
