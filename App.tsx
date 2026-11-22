@@ -5,7 +5,6 @@ import { ChatArea } from './components/ChatArea';
 import { InputArea } from './components/InputArea';
 import { QRModal } from './components/QRModal';
 import { CallInterface } from './components/CallInterface';
-import { parseMarkdown } from './utils/markdown';
 import { QrCode, Radio, Activity, ShieldCheck, ShieldAlert, Phone, Download, Smartphone } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -311,7 +310,6 @@ const App: React.FC = () => {
                 <InputArea
                     onSend={sendText}
                     onFileUpload={sendFile}
-                    parseMarkdown={parseMarkdown}
                 />
             </div>
         </div>

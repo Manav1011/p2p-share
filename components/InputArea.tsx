@@ -2,12 +2,11 @@ import React, { useRef, useState } from 'react';
 import { Bold, Italic, Strikethrough, Code, Quote, List, ListOrdered, Send, Paperclip, Terminal } from 'lucide-react';
 
 interface InputAreaProps {
-    onSend: (text: string, formatted: string) => void;
+    onSend: (text: string) => void;
     onFileUpload: (file: File) => void;
-    parseMarkdown: (text: string) => string;
 }
 
-export const InputArea: React.FC<InputAreaProps> = ({ onSend, onFileUpload, parseMarkdown }) => {
+export const InputArea: React.FC<InputAreaProps> = ({ onSend, onFileUpload }) => {
     const inputRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [hasContent, setHasContent] = useState(false);
@@ -37,8 +36,7 @@ export const InputArea: React.FC<InputAreaProps> = ({ onSend, onFileUpload, pars
         const text = inputRef.current.innerText.trim();
         if (!text) return;
 
-        const formatted = parseMarkdown(text);
-        onSend(text, formatted);
+        onSend(text);
         inputRef.current.innerText = '';
         setHasContent(false);
     };

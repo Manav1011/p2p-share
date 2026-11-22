@@ -19,14 +19,6 @@ export interface Message {
   needsAcceptance?: boolean; // If true, shows "Save to Disk" button
 }
 
-export interface FileChunkData {
-  type: 'file-chunk';
-  id: string;
-  chunk: Uint8Array;
-  offset: number;
-  size: number;
-}
-
 export interface FileMetaData {
   type: 'file-meta';
   id: string;
@@ -39,7 +31,6 @@ export interface FileMetaData {
 export interface TextData {
   type: 'text';
   content: string;
-  formatted: string;
 }
 
 // Extend Window for File System Access API

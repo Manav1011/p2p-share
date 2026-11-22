@@ -1,5 +1,5 @@
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Phone, PhoneOff, Mic, MicOff, Volume2, User } from 'lucide-react';
 
 interface CallInterfaceProps {
@@ -26,14 +26,22 @@ export const CallInterface: React.FC<CallInterfaceProps> = ({
     const audioRef = useRef<HTMLAudioElement>(null);
     const [muted, setMuted] = useState(false);
     const [duration, setDuration] = useState(0);
+    // Fixed per mount so the waveform doesn't re-randomize on every timer tick
+    const waveHeights = useMemo(() => Array.from({ length: 10 }, () => 30 + Math.random() * 70), []);
 
-    // Handle remote audio stream
+    // Handle remote audio stream. Also re-run when the call becomes active, since the
+    // <audio> element only exists once the active-call bar has rendered.
     useEffect(() => {
-        if (remoteStream && audioRef.current) {
+        if (remoteStream && activeCall && audioRef.current) {
             audioRef.current.srcObject = remoteStream;
             audioRef.current.play().catch(e => console.error("Error playing audio:", e));
         }
-    }, [remoteStream]);
+    }, [remoteStream, activeCall]);
+
+    // A new call starts with an unmuted microphone, so clear any stale mute state
+    useEffect(() => {
+        setMuted(false);
+    }, [localStream]);
 
     // Duration timer
     useEffect(() => {
@@ -140,12 +148,12 @@ export const CallInterface: React.FC<CallInterfaceProps> = ({
 
                 {/* Waveform Visualization (Fake CSS animation) */}
                 <div className="hidden sm:flex items-center gap-0.5 h-4 mx-4">
-                    {[...Array(10)].map((_, i) => (
-                        <div 
-                            key={i} 
+                    {waveHeights.map((h, i) => (
+                        <div
+                            key={i}
                             className="w-1 bg-app-accent/50 animate-[scan_1s_ease-in-out_infinite]"
-                            style={{ 
-                                height: `${Math.random() * 100}%`,
+                            style={{
+                                height: `${h}%`,
                                 animationDelay: `${i * 0.1}s` 
                             }} 
                         />

@@ -1,11 +1,45 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { DataConnection, MediaConnection } from 'peerjs';
-import { Message, FileMetadata, FileChunkData, TextData, FileMetaData } from '../types';
+import { Message, FileMetaData, TextData } from '../types';
+import { parseMarkdown } from '../utils/markdown';
 
-const CHUNK_SIZE = 64 * 1024; // 64KB - Stable, avoids fragmentation
-const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024; // 4MB - Avoids congestion stalls
-const BACKPRESSURE_RESUME_THRESHOLD = 2 * 1024 * 1024; // 2MB
-const UI_UPDATE_INTERVAL = 1000;
+// Chunks are sent as raw ArrayBuffers over the RTCDataChannel. 192KB + header stays
+// well under Chrome's 256KB per-message limit.
+const CHUNK_SIZE = 192 * 1024;
+const MAX_TEXT_LENGTH = CHUNK_SIZE;     // Text travels as one JSON message
+const HIGH_WATER = 4 * 1024 * 1024;     // Pause sending when this much is queued in the channel
+const LOW_WATER = 1 * 1024 * 1024;      // Resume once the channel drains to this level
+const WRITE_BATCH = 8 * 1024 * 1024;    // Batch disk writes to cut per-write overhead
+const DRAIN_RECHECK_MS = 200;           // Re-check connection state even if no drain event arrives
+const UI_UPDATE_INTERVAL = 250;
+const CONNECT_TIMEOUT_MS = 20000;
+
+interface SendState {
+    file: File;
+    offset: number;
+    idBytes: Uint8Array;
+    lastUi: number;
+}
+
+interface Receiver {
+    id: string;
+    name: string;
+    size: number;
+    mimeType: string;
+    received: number;
+    seen: Set<number>;                       // offsets already accepted (dedupe)
+    ram: Map<number, Uint8Array>;            // chunks held in memory until a disk sink exists
+    handle: FileSystemFileHandle | null;
+    writable: FileSystemWritableFileStream | null;
+    pending: Uint8Array[];                   // chunks waiting to be batched to disk
+    pendingBytes: number;
+    queue: Promise<void>;                    // serialises disk writes
+    lastUi: number;
+    accepting: boolean;
+    done: boolean;
+    failed: boolean;
+    result: Blob | null;                     // finished in-memory file, kept for a late "save to disk"
+}
 
 // Helper to guess MIME type if missing
 const getFallbackMimeType = (name: string) => {
@@ -28,6 +62,42 @@ const getFallbackMimeType = (name: string) => {
     }
 };
 
+const micErrorMessage = (err: any, action: string) =>
+    err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError'
+        ? `❌ Microphone permission denied. Allow microphone access to ${action}.`
+        : '❌ Error accessing microphone. Check your settings.';
+
+// Resolves when the channel drains below LOW_WATER, or after a short timeout so the
+// caller can re-check that the connection is still alive.
+const waitForDrain = (dc: RTCDataChannel) => new Promise<void>(resolve => {
+    let timer: ReturnType<typeof setTimeout>;
+    const done = () => {
+        dc.removeEventListener('bufferedamountlow', done);
+        clearTimeout(timer);
+        resolve();
+    };
+    timer = setTimeout(done, DRAIN_RECHECK_MS);
+    dc.addEventListener('bufferedamountlow', done);
+});
+
+// Wire format for a file chunk: [idLen u8][id bytes][offset u64][data]
+const encodeChunk = (idBytes: Uint8Array, offset: number, data: ArrayBuffer): ArrayBuffer => {
+    const out = new Uint8Array(1 + idBytes.length + 8 + data.byteLength);
+    out[0] = idBytes.length;
+    out.set(idBytes, 1);
+    new DataView(out.buffer).setBigUint64(1 + idBytes.length, BigInt(offset));
+    out.set(new Uint8Array(data), 1 + idBytes.length + 8);
+    return out.buffer;
+};
+
+const decodeChunk = (buf: ArrayBuffer) => {
+    const bytes = new Uint8Array(buf);
+    const idLen = bytes[0];
+    const id = new TextDecoder().decode(bytes.subarray(1, 1 + idLen));
+    const offset = Number(new DataView(buf).getBigUint64(1 + idLen));
+    return { id, offset, chunk: bytes.subarray(1 + idLen + 8) };
+};
+
 export const useWebRTC = () => {
     const [myPeerId, setMyPeerId] = useState<string>('');
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
@@ -41,15 +111,29 @@ export const useWebRTC = () => {
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     const [isCalling, setIsCalling] = useState(false);
 
+    // Everything the long-lived event handlers touch lives in refs or stable setters,
+    // so handlers captured by the one-time peer setup always see current state.
     const peerRef = useRef<Peer | null>(null);
     const connRef = useRef<DataConnection | null>(null);
-
-    // File Transfer Refs
-    const fileReceivers = useRef<Map<string, any>>(new Map());
+    const myIdRef = useRef('');
     const retryCount = useRef(0);
+    const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const localStreamRef = useRef<MediaStream | null>(null);
+    const activeCallRef = useRef<MediaConnection | null>(null);
+    const incomingCallRef = useRef<MediaConnection | null>(null);
+    const callSeqRef = useRef(0);
+
+    const sendsRef = useRef<Map<string, SendState>>(new Map());
+    const receiversRef = useRef<Map<string, Receiver>>(new Map());
+    const pumpRunning = useRef(false);
 
     const addMessage = useCallback((msg: Message) => {
         setMessages(prev => [...prev, msg]);
+    }, []);
+
+    const updateMessage = useCallback((id: string, patch: Partial<Message>) => {
+        setMessages(prev => prev.map(m => (m.id === id ? { ...m, ...patch } : m)));
     }, []);
 
     const addSystemMessage = useCallback((text: string) => {
@@ -71,522 +155,323 @@ export const useWebRTC = () => {
         document.body.removeChild(a);
     };
 
-    useEffect(() => {
-        const initPeer = async () => {
-            // GUEST MODE: Generate random ID
-            const peerId = Math.random().toString(36).substring(2, 6);
-
-            const peer = new Peer(peerId, {
-                debug: 2,
-                config: {
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:global.stun.twilio.com:3478' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
-                        { urls: 'stun:stun2.l.google.com:19302' },
-                        { urls: 'stun:stun.services.mozilla.com' }
-                    ]
-                }
-            });
-
-            peer.on('open', (id) => {
-                setMyPeerId(id);
-                addSystemMessage(`Your ID: ${id}`);
-                retryCount.current = 0;
-            });
-
-            peer.on('connection', (conn) => {
-                const isMain = conn.label !== 'file-transfer';
-
-                if (isMain) {
-                    // SINGLE CONNECTION GUARD
-                    if (connRef.current && connRef.current.open) {
-                        console.warn("Blocking incoming connection - Already connected");
-                        conn.close();
-                        return;
-                    }
-
-                    connRef.current = conn;
-                    setConnectionStatus('connected');
-                    setConnectedPeerId(conn.peer);
-                    addSystemMessage(`Connected to peer: ${conn.peer}`);
-                    setupConnection(conn, true);
-                } else {
-                    setupConnection(conn, false);
-                }
-            });
-
-            peer.on('call', (call) => {
-                setIncomingCall(call);
-            });
-
-            peer.on('error', (err) => {
-                console.error('Peer error:', err.type, err);
-
-                if (err.type === 'peer-unavailable') {
-                    addSystemMessage(`Peer ${connectedPeerId} not found.`);
-                    setConnectionStatus('disconnected');
-                    return;
-                }
-
-                if (err.type === 'unavailable-id') {
-                    if (retryCount.current < 5) {
-                        retryCount.current += 1;
-                        const delay = 2000 * retryCount.current;
-                        addSystemMessage(`⚠️ ID Active. Retrying cleanup (${retryCount.current}/5) in ${delay / 1000}s...`);
-
-                        setTimeout(() => {
-                            peer.destroy();
-                            initPeer();
-                        }, delay);
-                    } else {
-                        addSystemMessage("❌ ID Locked. Please close other tabs or wait 30s.");
-                        setConnectionStatus('disconnected');
-                    }
-                    return; // Early return to avoid generic error
-                }
-
-                if (err.type === 'disconnected') {
-                    peer.reconnect();
-                }
-
-                setConnectionStatus('disconnected');
-                addSystemMessage(`Error: ${err.type}`);
-            });
-
-            peer.on('disconnected', () => {
-                setConnectionStatus('disconnected');
-                // Attempt to reconnect to signaling server if not destroyed
-                if (peer && !peer.destroyed) {
-                    // peer.reconnect(); // Can cause loops if completely dead
-                }
-            });
-
-            peerRef.current = peer;
-        };
-
-        const timer = setTimeout(initPeer, 100); // Slight delay to allow cleanup
-
-        const handleUnload = () => {
-            endCall();
-            peerRef.current?.destroy();
-        };
-        window.addEventListener('beforeunload', handleUnload);
-
-        return () => {
-            clearTimeout(timer);
-            window.removeEventListener('beforeunload', handleUnload);
-            endCall();
-            peerRef.current?.destroy();
-        };
-    }, [addSystemMessage]);
-
-    const setupConnection = (conn: DataConnection, isMain: boolean = true) => {
-        conn.on('data', (data: any) => {
-            if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-                handleBinaryChunk(data);
-                return;
-            }
-
-            if (data.type === 'text') {
-                addMessage({
-                    id: Math.random().toString(36),
-                    type: 'text',
-                    content: data.content,
-                    formatted: data.formatted,
-                    sender: 'peer',
-                    timestamp: Date.now()
-                });
-            } else if (data.type === 'file-meta') {
-                handleFileMeta(data);
-            } else if (data.type === 'file-chunk') {
-                handleFileChunk(data);
-            }
-        });
-
-        conn.on('close', () => {
-            if (isMain) {
-                setConnectionStatus('disconnected');
-                setConnectedPeerId('');
-                addSystemMessage('Peer disconnected');
-                connRef.current = null;
-                endCall();
-            }
-        });
-
-        conn.on('error', (err) => {
-            // Suppress trivial errors on close
-            if (err.message?.includes('Connection is not open')) return;
-            if (isMain) {
-                addSystemMessage(`Connection error: ${err.message}`);
-            } else {
-                console.error(`Side-channel error: ${err.message}`);
-            }
-        });
-    };
-
-    const handleBinaryChunk = (data: ArrayBuffer | Uint8Array) => {
-        const buffer = data instanceof Uint8Array ? data.buffer : data;
-        const array = new Uint8Array(buffer); // Zero-copy view
-        const view = new DataView(buffer);
-
-        // Parse Header
-        const idLen = array[0];
-        const idBytes = array.subarray(1, 1 + idLen); // subarray is faster than slice
-        const id = new TextDecoder().decode(idBytes);
-
-        const offset = Number(view.getBigUint64(1 + idLen));
-
-        const headerSize = 1 + idLen + 8;
-        const chunk = array.subarray(headerSize);
-
-        handleFileChunk({
-            id,
-            offset,
-            chunk,
-            type: 'file-chunk',
-            size: 0
-        });
-    };
-
-    const connectToPeer = (peerId: string) => {
-        if (!peerRef.current) return;
-
-        // Close existing connection if any
-        if (connRef.current) {
-            connRef.current.close();
-        }
-
-        setConnectionStatus('connecting');
-        addSystemMessage(`Connecting to ${peerId}...`);
-
-        const conn = peerRef.current.connect(peerId, {
-            reliable: true,
-            serialization: 'binary'
-        });
-        connRef.current = conn;
-
-        conn.on('open', () => {
-            setConnectionStatus('connected');
-            setConnectedPeerId(peerId);
-            setupConnection(conn);
-            addSystemMessage(`Connected to ${peerId}`);
-        });
-
-        conn.on('error', (err) => {
-            setConnectionStatus('disconnected');
-            addSystemMessage(`Failed to connect: ${err.message}`);
-        });
-    };
-
-    const disconnectPeer = () => {
-        if (connRef.current) {
-            connRef.current.close();
-        }
-        setConnectionStatus('disconnected');
-        setConnectedPeerId('');
-        addSystemMessage('Disconnected manually');
-        connRef.current = null;
-    };
-
     // --- Voice Call Logic ---
 
-    const startCall = async () => {
-        if (!connectedPeerId || !peerRef.current) return;
+    const endCall = useCallback(() => {
+        callSeqRef.current++; // invalidates any getUserMedia still in flight
+        const call = activeCallRef.current;
+        const incoming = incomingCallRef.current;
+        activeCallRef.current = null;
+        incomingCallRef.current = null;
 
-        try {
-            setIsCalling(true);
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-            setLocalStream(stream);
+        localStreamRef.current?.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
 
-            const call = peerRef.current.call(connectedPeerId, stream);
-            setupCallEvents(call);
-        } catch (err: any) {
-            console.error("Failed to get local stream", err);
-            setIsCalling(false);
-            if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                addSystemMessage("❌ Microphone permission denied. Please allow microphone access to call.");
-            } else {
-                addSystemMessage("❌ Error accessing microphone. Check your settings.");
-            }
-        }
-    };
-
-    const answerCall = async () => {
-        if (!incomingCall) return;
-
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-            setLocalStream(stream);
-
-            incomingCall.answer(stream);
-            setupCallEvents(incomingCall);
-            setIncomingCall(null);
-        } catch (err: any) {
-            console.error("Failed to answer call", err);
-            setIncomingCall(null);
-            if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-                addSystemMessage("❌ Microphone permission denied. Cannot answer call.");
-            } else {
-                addSystemMessage("❌ Error accessing microphone.");
-            }
-        }
-    };
-
-    const rejectCall = () => {
-        if (incomingCall) {
-            incomingCall.close();
-            setIncomingCall(null);
-        }
-    };
-
-    const endCall = () => {
-        if (activeCall) {
-            activeCall.close();
-        }
-        if (localStream) {
-            localStream.getTracks().forEach(track => track.stop());
-        }
+        call?.close();
+        incoming?.close();
 
         setActiveCall(null);
         setRemoteStream(null);
         setLocalStream(null);
         setIsCalling(false);
         setIncomingCall(null);
-    };
 
-    const setupCallEvents = (call: MediaConnection) => {
-        setActiveCall(call);
-        setIsCalling(false);
+        if (call) addSystemMessage('Call ended');
+    }, [addSystemMessage]);
+
+    const setupCallEvents = (call: MediaConnection, awaitingAnswer: boolean) => {
+        activeCallRef.current = call;
+        if (!awaitingAnswer) {
+            setActiveCall(call);
+            setIsCalling(false);
+        }
 
         call.on('stream', (stream) => {
+            if (activeCallRef.current !== call) return;
             setRemoteStream(stream);
+            setActiveCall(call);
+            setIsCalling(false);
         });
 
         call.on('close', () => {
-            endCall();
-            addSystemMessage("Call ended");
+            if (activeCallRef.current === call) endCall();
         });
 
         call.on('error', (err) => {
-            console.error("Call error", err);
-            endCall();
+            console.error('Call error', err);
+            if (activeCallRef.current === call) endCall();
         });
     };
 
-    // --- End Voice Call Logic ---
+    const startCall = async () => {
+        const peer = peerRef.current;
+        const conn = connRef.current;
+        if (!peer || !conn?.open || activeCallRef.current || incomingCallRef.current) return;
 
-    const sendText = (text: string, formatted: string) => {
-        if (!connRef.current?.open) {
-            addSystemMessage('Not connected');
-            return;
+        const seq = ++callSeqRef.current;
+        setIsCalling(true);
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            if (seq !== callSeqRef.current || !connRef.current?.open) {
+                // Cancelled or disconnected while the permission prompt was open
+                stream.getTracks().forEach(track => track.stop());
+                return;
+            }
+            localStreamRef.current = stream;
+            setLocalStream(stream);
+
+            const call = peer.call(conn.peer, stream);
+            setupCallEvents(call, true);
+        } catch (err: any) {
+            console.error('Failed to get local stream', err);
+            if (seq === callSeqRef.current) setIsCalling(false);
+            addSystemMessage(micErrorMessage(err, 'call'));
         }
-
-        connRef.current.send({
-            type: 'text',
-            content: text,
-            formatted
-        } as TextData);
-
-        addMessage({
-            id: Math.random().toString(36),
-            type: 'text',
-            content: text,
-            formatted,
-            sender: 'me',
-            timestamp: Date.now()
-        });
     };
 
-    const activeTransferRefs = useRef<Map<string, {
-        file: File,
-        offset: number,
-        idBytes: Uint8Array,
-        lastUiUpdate: number
-    }>>(new Map());
-    const isLoopRunning = useRef(false);
+    const answerCall = async () => {
+        const incoming = incomingCallRef.current;
+        if (!incoming) return;
 
-    const runTransferLoop = useCallback(async () => {
-        if (isLoopRunning.current) return;
-        isLoopRunning.current = true;
-
-        while (activeTransferRefs.current.size > 0) {
-            const conn = connRef.current;
-            if (!conn || !conn.open) {
-                activeTransferRefs.current.forEach((_, id) => {
-                    setMessages(prev => prev.map(m => m.id === id ? { ...m, progress: -1 } : m));
-                });
-                activeTransferRefs.current.clear();
-                break;
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            if (incomingCallRef.current !== incoming) {
+                // Caller hung up or call was ended while the permission prompt was open
+                stream.getTracks().forEach(track => track.stop());
+                return;
             }
+            incomingCallRef.current = null;
+            setIncomingCall(null);
 
-            const dataChannel = conn.dataChannel as any;
-            if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-                await new Promise<void>(resolve => {
-                    const onLow = () => {
-                        dataChannel.removeEventListener('bufferedamountlow', onLow);
-                        resolve();
-                    };
-                    dataChannel.addEventListener('bufferedamountlow', onLow);
-                    setTimeout(resolve, 50);
-                });
-                continue;
+            localStreamRef.current = stream;
+            setLocalStream(stream);
+            incoming.answer(stream);
+            setupCallEvents(incoming, false);
+        } catch (err: any) {
+            console.error('Failed to answer call', err);
+            if (incomingCallRef.current === incoming) {
+                incomingCallRef.current = null;
+                setIncomingCall(null);
             }
-
-            // Round-robin one chunk for each file
-            for (const [id, state] of Array.from(activeTransferRefs.current.entries())) {
-                try {
-                    const chunkDataBuffer = await state.file.slice(state.offset, state.offset + CHUNK_SIZE).arrayBuffer();
-                    const chunkData = new Uint8Array(chunkDataBuffer);
-
-                    const headerSize = 1 + state.idBytes.length + 8;
-                    const packet = new Uint8Array(headerSize + chunkData.length);
-                    const view = new DataView(packet.buffer);
-
-                    packet[0] = state.idBytes.length;
-                    packet.set(state.idBytes, 1);
-                    view.setBigUint64(1 + state.idBytes.length, BigInt(state.offset));
-                    packet.set(chunkData, headerSize);
-
-                    conn.send(packet);
-                    state.offset += chunkData.length;
-
-                    const now = Date.now();
-                    if (now - state.lastUiUpdate > UI_UPDATE_INTERVAL || state.offset >= state.file.size) {
-                        state.lastUiUpdate = now;
-                        const progress = Math.min(100, (state.offset / state.file.size) * 100);
-                        setMessages(prev => prev.map(m => m.id === id ? { ...m, progress } : m));
-                    }
-
-                    if (state.offset >= state.file.size) {
-                        activeTransferRefs.current.delete(id);
-                    }
-                } catch (e) {
-                    console.error("Transfer error for", id, e);
-                    activeTransferRefs.current.delete(id);
-                    setMessages(prev => prev.map(m => m.id === id ? { ...m, progress: -1 } : m));
-                }
-
-                if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_AMOUNT) break;
-            }
-
-            await new Promise(resolve => setTimeout(resolve, 10)); // Yield to CPU
+            incoming.close();
+            addSystemMessage(micErrorMessage(err, 'answer the call'));
         }
-        isLoopRunning.current = false;
-    }, [setMessages]);
+    };
 
-    const sendFile = useCallback((file: File) => {
-        if (!connRef.current?.open) {
-            addSystemMessage('Not connected');
-            return;
-        }
+    const rejectCall = () => {
+        const incoming = incomingCallRef.current;
+        incomingCallRef.current = null;
+        setIncomingCall(null);
+        incoming?.close();
+    };
 
-        const fileId = Math.random().toString(36).substring(2);
-        const idBytes = new TextEncoder().encode(fileId);
+    // --- Transfer Helpers ---
 
-        addMessage({
-            id: fileId,
-            type: 'file',
-            content: { id: fileId, name: file.name, size: file.size },
-            sender: 'me',
-            timestamp: Date.now(),
-            progress: 0
-        });
+    const failAllSends = () => {
+        sendsRef.current.forEach((_, id) => updateMessage(id, { progress: -1 }));
+        sendsRef.current.clear();
+    };
 
-        connRef.current.send({
-            type: 'file-meta',
-            id: fileId,
-            name: file.name,
-            size: file.size,
-            chunkSize: CHUNK_SIZE,
-            mimeType: file.type || getFallbackMimeType(file.name)
-        } as FileMetaData);
+    const failReceive = (r: Receiver, reason: string) => {
+        if (r.done || r.failed) return;
+        r.failed = true;
+        receiversRef.current.delete(r.id);
+        r.pending = [];
+        r.pendingBytes = 0;
+        r.ram.clear();
+        r.writable?.abort().catch(() => { /* already closed */ });
+        updateMessage(r.id, { progress: -1, needsAcceptance: false });
+        addSystemMessage(`Transfer of ${r.name} failed: ${reason}`);
+    };
 
-        activeTransferRefs.current.set(fileId, {
-            file,
-            offset: 0,
-            idBytes,
-            lastUiUpdate: Date.now()
-        });
+    const failAllReceives = (reason: string) => {
+        receiversRef.current.forEach(r => failReceive(r, reason));
+    };
 
-        runTransferLoop();
-    }, [addMessage, runTransferLoop, addSystemMessage]);
+    // --- Connection Logic ---
 
-    const handleFileMeta = (data: FileMetaData) => {
-        addSystemMessage(`Receiving ${data.name}...`);
+    const handleConnectionLost = (reason: string) => {
+        connRef.current = null;
+        setConnectionStatus('disconnected');
+        setConnectedPeerId('');
+        addSystemMessage(reason);
+        endCall();
+        failAllSends();
+        failAllReceives('connection lost');
+    };
 
-        const receiver = {
-            id: data.id,
-            name: data.name,
-            size: data.size,
-            mimeType: data.mimeType || getFallbackMimeType(data.name),
-            receivedBytes: 0,
-            chunks: new Map<number, Uint8Array>(),
-            receivedChunks: new Set<number>(),
-            lastUpdate: 0,
-            lastProgress: 0,
-            writable: null,
-            fileHandle: null,
-            writeBuffer: [] as Uint8Array[],
-            writeBufferSize: 0,
-            writeQueue: Promise.resolve(), // Serialization queue for writes
-        };
-
-        fileReceivers.current.set(data.id, receiver);
+    const handleFileMeta = (meta: FileMetaData) => {
+        if (receiversRef.current.has(meta.id)) return;
 
         const supportsFSA = 'showSaveFilePicker' in window;
+        const r: Receiver = {
+            id: meta.id,
+            name: meta.name,
+            size: meta.size,
+            mimeType: meta.mimeType || getFallbackMimeType(meta.name),
+            received: 0,
+            seen: new Set(),
+            ram: new Map(),
+            handle: null,
+            writable: null,
+            pending: [],
+            pendingBytes: 0,
+            queue: Promise.resolve(),
+            lastUi: 0,
+            accepting: false,
+            done: false,
+            failed: false,
+            result: null,
+        };
+        receiversRef.current.set(meta.id, r);
 
         addMessage({
-            id: data.id,
+            id: meta.id,
             type: 'file',
-            content: { id: data.id, name: data.name, size: data.size },
+            content: { id: meta.id, name: meta.name, size: meta.size },
             sender: 'peer',
             timestamp: Date.now(),
             progress: 0,
-            needsAcceptance: supportsFSA
+            needsAcceptance: supportsFSA && meta.size > 0
         });
+        addSystemMessage(`Receiving ${meta.name}...`);
+
+        // Zero-byte files have no chunks, so they complete immediately
+        if (meta.size === 0) finishReceive(r);
+    };
+
+    const flushWrites = (r: Receiver) => {
+        if (!r.writable || r.pending.length === 0) return;
+        const parts = r.pending;
+        const writable = r.writable;
+        r.pending = [];
+        r.pendingBytes = 0;
+        r.queue = r.queue
+            .then(() => writable.write(new Blob(parts as BlobPart[])))
+            .catch(err => {
+                console.error('Disk write failed', err);
+                failReceive(r, 'could not write to disk');
+            });
+    };
+
+    const handleChunk = (id: string, offset: number, chunk: Uint8Array) => {
+        const r = receiversRef.current.get(id);
+        if (!r || r.done || r.failed || r.seen.has(offset)) return;
+
+        r.seen.add(offset);
+        r.received += chunk.byteLength;
+
+        if (r.writable) {
+            r.pending.push(chunk);
+            r.pendingBytes += chunk.byteLength;
+            if (r.pendingBytes >= WRITE_BATCH) flushWrites(r);
+        } else {
+            r.ram.set(offset, chunk);
+        }
+
+        if (r.received >= r.size) {
+            finishReceive(r);
+            return;
+        }
+
+        const now = Date.now();
+        if (now - r.lastUi >= UI_UPDATE_INTERVAL) {
+            r.lastUi = now;
+            updateMessage(id, { progress: (r.received / r.size) * 100 });
+        }
+    };
+
+    const finishReceive = async (r: Receiver) => {
+        if (r.done || r.failed) return;
+        r.done = true;
+
+        let url: string;
+        try {
+            if (r.writable) {
+                flushWrites(r);
+                await r.queue;
+                if (r.failed) return;
+                await r.writable.close();
+                r.writable = null;
+                const file = await r.handle!.getFile();
+                url = URL.createObjectURL(file.slice(0, file.size, r.mimeType));
+                addSystemMessage(`Saved ${r.name} to disk`);
+            } else {
+                const parts = Array.from(r.ram.entries())
+                    .sort((a, b) => a[0] - b[0])
+                    .map(entry => entry[1]);
+                const blob = new Blob(parts as BlobPart[], { type: r.mimeType });
+                r.result = blob;
+                r.ram.clear();
+                url = URL.createObjectURL(blob);
+                addSystemMessage(`Received ${r.name}`);
+            }
+        } catch (err) {
+            console.error('Error finalising file', err);
+            r.done = false;
+            failReceive(r, 'could not finalise file');
+            return;
+        }
+
+        receiversRef.current.delete(r.id);
+        updateMessage(r.id, { progress: 100, blobUrl: url, needsAcceptance: false });
     };
 
     const acceptFileTransfer = async (fileId: string) => {
-        const receiver = fileReceivers.current.get(fileId);
-        if (!receiver) return;
+        const r = receiversRef.current.get(fileId) ?? null;
+        if (!r || r.done || r.failed || r.writable || r.accepting) return;
+        r.accepting = true;
 
+        let handle: FileSystemFileHandle;
+        let writable: FileSystemWritableFileStream;
         try {
-            const handle = await window.showSaveFilePicker({
-                suggestedName: receiver.name
-            });
-            const writable = await handle.createWritable();
-
-            receiver.fileHandle = handle;
-            receiver.writable = writable;
-
-            // Flush any chunks received before acceptance
-            if (receiver.chunks.size > 0) {
-                const sortedChunks = Array.from(receiver.chunks.entries())
-                    .sort((a: any, b: any) => a[0] - b[0])
-                    .map((entry: any) => entry[1]);
-
-                const blob = new Blob(sortedChunks);
-                await writable.write(blob);
-                receiver.chunks.clear();
-            }
-
-            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
-
-            if (receiver.receivedBytes >= receiver.size) {
-                finishFileReceive(receiver);
-            }
-
+            handle = await window.showSaveFilePicker({ suggestedName: r.name });
+            writable = await handle.createWritable();
         } catch (err: any) {
-            setMessages(prev => prev.map(m => m.id === fileId ? { ...m, needsAcceptance: false } : m));
-
-            if (err.name === 'SecurityError' || (err.message && err.message.includes('Cross origin'))) {
-                addSystemMessage("⚠️ Direct Disk Access is blocked in this preview window. Using RAM instead.");
-            } else if (err.name !== 'AbortError') {
-                console.error('File save init failed:', err);
-                addSystemMessage(`Stream setup failed: ${err.message}. Buffering in RAM.`);
-            }
+            r.accepting = false;
+            if (err?.name === 'AbortError') return; // user cancelled; button stays for another try
+            console.error('Save location failed', err);
+            updateMessage(fileId, { needsAcceptance: false });
+            addSystemMessage(`Could not open a save location (${err?.message ?? err}). The file stays available for download.`);
+            return;
         }
+        r.accepting = false;
+
+        if (r.failed) {
+            await writable.abort().catch(() => { /* ignore */ });
+            return;
+        }
+
+        if (r.done && r.result) {
+            // Finished while the picker was open: write the kept copy
+            try {
+                await writable.write(r.result);
+                await writable.close();
+                addSystemMessage(`Saved ${r.name} to disk`);
+            } catch (err) {
+                console.error('Save failed', err);
+                await writable.abort().catch(() => { /* ignore */ });
+                addSystemMessage(`Could not save ${r.name} to disk`);
+            }
+            updateMessage(fileId, { needsAcceptance: false });
+            return;
+        }
+
+        r.handle = handle;
+        r.writable = writable;
+
+        // Hand everything received so far to the disk stream in offset order. No chunk can
+        // arrive between here and the flush, so ordering is preserved.
+        const ramParts = Array.from(r.ram.entries())
+            .sort((a, b) => a[0] - b[0])
+            .map(entry => entry[1]);
+        r.ram.clear();
+        for (const part of ramParts) {
+            r.pending.push(part);
+            r.pendingBytes += part.byteLength;
+        }
+        flushWrites(r);
+        updateMessage(fileId, { needsAcceptance: false });
     };
 
     const saveFileToDisk = async (blobUrl: string, fileName: string) => {
@@ -620,110 +505,366 @@ export const useWebRTC = () => {
         }
     };
 
-    const flushWriteBuffer = async (receiver: any) => {
-        if (!receiver.writable || receiver.writeBuffer.length === 0) return;
+    // Sends queued file chunks, pacing on the data channel's buffer rather than timers.
+    const pumpSends = useCallback(async () => {
+        if (pumpRunning.current) return;
+        pumpRunning.current = true;
 
-        // 1. Swap buffer immediately to avoid race conditions with incoming chunks
-        const chunksToWrite = [...receiver.writeBuffer];
-        receiver.writeBuffer = [];
-        receiver.writeBufferSize = 0;
+        try {
+            while (sendsRef.current.size > 0) {
+                const conn = connRef.current;
+                if (!conn?.open) {
+                    failAllSends();
+                    break;
+                }
 
-        // 2. Write asynchronously without blocking
-        receiver.writeQueue = receiver.writeQueue.then(async () => {
-            try {
-                const blob = new Blob(chunksToWrite);
-                await receiver.writable.write(blob);
-            } catch (err) {
-                console.error("Error writing to disk", err);
-                addSystemMessage("Error writing to disk - file may be corrupt");
+                const dc = conn.dataChannel;
+                dc.bufferedAmountLowThreshold = LOW_WATER;
+                if (dc.bufferedAmount > HIGH_WATER) {
+                    await waitForDrain(dc);
+                    continue;
+                }
+
+                // Round-robin one chunk per active file
+                for (const [id, st] of Array.from(sendsRef.current.entries())) {
+                    if (dc.bufferedAmount > HIGH_WATER) break;
+
+                    try {
+                        const end = Math.min(st.offset + CHUNK_SIZE, st.file.size);
+                        const data = await st.file.slice(st.offset, end).arrayBuffer();
+                        // Connection dropped or transfer cancelled while reading
+                        if (!conn.open || sendsRef.current.get(id) !== st) break;
+
+                        conn.send(encodeChunk(st.idBytes, st.offset, data));
+                        st.offset = end;
+                    } catch (err) {
+                        console.error('Transfer error for', id, err);
+                        sendsRef.current.delete(id);
+                        updateMessage(id, { progress: -1 });
+                        continue;
+                    }
+
+                    if (st.offset >= st.file.size) {
+                        sendsRef.current.delete(id);
+                        updateMessage(id, { progress: 100 });
+                    } else {
+                        const now = Date.now();
+                        if (now - st.lastUi >= UI_UPDATE_INTERVAL) {
+                            st.lastUi = now;
+                            updateMessage(id, { progress: (st.offset / st.file.size) * 100 });
+                        }
+                    }
+                }
             }
-        }).catch(err => {
-            console.error("Write queue error:", err);
+        } finally {
+            pumpRunning.current = false;
+        }
+    }, [updateMessage]);
+
+    const handleData = (data: unknown) => {
+        if (typeof data === 'string') {
+            let msg: any;
+            try {
+                msg = JSON.parse(data);
+            } catch {
+                return;
+            }
+            if (msg?.type === 'text' && typeof msg.content === 'string') {
+                const content: string = msg.content;
+                addMessage({
+                    id: Math.random().toString(36),
+                    type: 'text',
+                    content,
+                    // Rendered locally from plain text, so a peer cannot inject HTML
+                    formatted: parseMarkdown(content),
+                    sender: 'peer',
+                    timestamp: Date.now()
+                });
+            } else if (msg?.type === 'file-meta') {
+                handleFileMeta(msg as FileMetaData);
+            }
+        } else if (data instanceof ArrayBuffer) {
+            const { id, offset, chunk } = decodeChunk(data);
+            handleChunk(id, offset, chunk);
+        }
+    };
+
+    const setupConnection = (conn: DataConnection) => {
+        conn.on('data', handleData);
+
+        conn.on('close', () => {
+            if (connRef.current === conn) handleConnectionLost('Peer disconnected');
+        });
+
+        conn.on('error', (err) => {
+            if (connRef.current !== conn) return;
+            if (err.message?.includes('Connection is not open')) return;
+            if (!conn.open) {
+                connRef.current = null;
+                setConnectionStatus('disconnected');
+                addSystemMessage(`Failed to connect: ${err.message}`);
+                return;
+            }
+            addSystemMessage(`Connection error: ${err.message}`);
         });
     };
 
-    const handleFileChunk = (data: FileChunkData) => {
-        const receiver = fileReceivers.current.get(data.id);
-        if (!receiver) return;
+    const adoptConnection = (conn: DataConnection) => {
+        connRef.current = conn;
+        setupConnection(conn);
 
-        if (!receiver.receivedChunks.has(data.offset)) {
-            receiver.receivedChunks.add(data.offset);
+        const onReady = () => {
+            if (connRef.current !== conn) return;
+            setConnectionStatus('connected');
+            setConnectedPeerId(conn.peer);
+            addSystemMessage(`Connected to ${conn.peer}`);
+        };
+        if (conn.open) onReady();
+        else conn.on('open', onReady);
+    };
 
-            if (receiver.writable) {
-                // Buffer writes to disk for speed
-                receiver.writeBuffer.push(data.chunk);
-                receiver.writeBufferSize += data.chunk.byteLength;
+    const connectToPeer = (rawId: string) => {
+        const peer = peerRef.current;
+        const id = rawId.trim().toLowerCase(); // IDs are lowercase; the input may not be
+        if (!peer || !id) return;
 
-                // Flush asynchronously - don't await to avoid blocking
-                if (receiver.writeBufferSize >= MAX_BUFFERED_AMOUNT) {
-                    flushWriteBuffer(receiver);
+        if (id === myIdRef.current) {
+            addSystemMessage("That's your own ID.");
+            return;
+        }
+
+        // Tear down any existing link first, detaching it so its close handler doesn't
+        // clear the new one
+        const old = connRef.current;
+        if (old) {
+            connRef.current = null;
+            old.close();
+            endCall();
+            failAllSends();
+            failAllReceives('connection replaced');
+        }
+
+        setConnectionStatus('connecting');
+        addSystemMessage(`Connecting to ${id}...`);
+
+        const conn = peer.connect(id, { reliable: true, serialization: 'none' });
+        const timeout = setTimeout(() => {
+            if (connRef.current === conn && !conn.open) {
+                connRef.current = null;
+                setConnectionStatus('disconnected');
+                addSystemMessage('Connection timed out');
+                conn.close();
+            }
+        }, CONNECT_TIMEOUT_MS);
+        conn.on('open', () => clearTimeout(timeout));
+
+        adoptConnection(conn);
+    };
+
+    const disconnectPeer = () => {
+        const conn = connRef.current;
+        if (!conn) return;
+        connRef.current = null;
+        conn.close();
+        setConnectionStatus('disconnected');
+        setConnectedPeerId('');
+        addSystemMessage('Disconnected manually');
+        endCall();
+        failAllSends();
+        failAllReceives('disconnected');
+    };
+
+    const sendText = (text: string) => {
+        const conn = connRef.current;
+        if (!conn?.open) {
+            addSystemMessage('Not connected');
+            return;
+        }
+        if (text.length > MAX_TEXT_LENGTH) {
+            addSystemMessage('Message too long to send.');
+            return;
+        }
+
+        const payload: TextData = { type: 'text', content: text };
+        try {
+            conn.send(JSON.stringify(payload));
+        } catch (err) {
+            console.error('Send failed', err);
+            addSystemMessage('Failed to send message.');
+            return;
+        }
+
+        addMessage({
+            id: Math.random().toString(36),
+            type: 'text',
+            content: text,
+            formatted: parseMarkdown(text),
+            sender: 'me',
+            timestamp: Date.now()
+        });
+    };
+
+    const sendFile = useCallback((file: File) => {
+        const conn = connRef.current;
+        if (!conn?.open) {
+            addSystemMessage('Not connected');
+            return;
+        }
+
+        const fileId = Math.random().toString(36).substring(2);
+        addMessage({
+            id: fileId,
+            type: 'file',
+            content: { id: fileId, name: file.name, size: file.size },
+            sender: 'me',
+            timestamp: Date.now(),
+            progress: 0
+        });
+
+        const meta: FileMetaData = {
+            type: 'file-meta',
+            id: fileId,
+            name: file.name,
+            size: file.size,
+            chunkSize: CHUNK_SIZE,
+            mimeType: file.type || getFallbackMimeType(file.name)
+        };
+        try {
+            conn.send(JSON.stringify(meta));
+        } catch (err) {
+            console.error('Send failed', err);
+            updateMessage(fileId, { progress: -1 });
+            return;
+        }
+
+        if (file.size === 0) {
+            updateMessage(fileId, { progress: 100 });
+            return;
+        }
+
+        sendsRef.current.set(fileId, {
+            file,
+            offset: 0,
+            idBytes: new TextEncoder().encode(fileId),
+            lastUi: 0
+        });
+        void pumpSends();
+    }, [addMessage, addSystemMessage, updateMessage, pumpSends]);
+
+    useEffect(() => {
+        let disposed = false;
+
+        const initPeer = () => {
+            if (disposed) return;
+
+            // GUEST MODE: Generate random ID
+            const peerId = Math.random().toString(36).substring(2, 8);
+
+            const peer = new Peer(peerId, {
+                debug: 2,
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:global.stun.twilio.com:3478' },
+                        { urls: 'stun:stun1.l.google.com:19302' },
+                        { urls: 'stun:stun2.l.google.com:19302' },
+                        { urls: 'stun:stun.services.mozilla.com' }
+                    ]
                 }
-            } else {
-                // Buffer in RAM (Fallback)
-                receiver.chunks.set(data.offset, data.chunk);
-            }
-
-            receiver.receivedBytes += data.chunk.byteLength;
-        }
-
-        const now = Date.now();
-        const currentProgress = (receiver.receivedBytes / receiver.size) * 100;
-
-        // Only update UI if enough time passed AND progress changed significantly OR transfer complete
-        if (receiver.receivedBytes >= receiver.size || (now - receiver.lastUpdate > UI_UPDATE_INTERVAL && currentProgress - (receiver.lastProgress || 0) >= 1)) {
-            receiver.lastUpdate = now;
-            receiver.lastProgress = currentProgress;
-
-            // Use requestAnimationFrame to defer UI update and not block data reception
-            requestAnimationFrame(() => {
-                setMessages(prev => prev.map(m => m.id === data.id ? { ...m, progress: currentProgress } : m));
             });
-        }
+            peerRef.current = peer;
 
-        if (receiver.receivedBytes >= receiver.size) {
-            finishFileReceive(receiver);
-        }
-    };
+            peer.on('open', (id) => {
+                myIdRef.current = id;
+                setMyPeerId(id);
+                addSystemMessage(`Your ID: ${id}`);
+                retryCount.current = 0;
+            });
 
-    const finishFileReceive = async (receiver: any) => {
-        let url;
+            peer.on('connection', (conn) => {
+                // SINGLE CONNECTION GUARD
+                if (connRef.current?.open) {
+                    console.warn('Blocking incoming connection - Already connected');
+                    conn.close();
+                    return;
+                }
+                // Replace a pending outgoing attempt
+                if (connRef.current) {
+                    const pending = connRef.current;
+                    connRef.current = null;
+                    pending.close();
+                }
+                adoptConnection(conn);
+            });
 
-        if (receiver.writable) {
-            try {
-                // Flush remaining buffer
-                await flushWriteBuffer(receiver);
-                // Wait for all writes to finish
-                await receiver.writeQueue;
+            peer.on('call', (call) => {
+                if (activeCallRef.current || incomingCallRef.current) {
+                    call.close(); // already busy
+                    return;
+                }
+                incomingCallRef.current = call;
+                setIncomingCall(call);
+                call.on('close', () => {
+                    if (incomingCallRef.current === call) {
+                        incomingCallRef.current = null;
+                        setIncomingCall(null);
+                    }
+                });
+            });
 
-                await receiver.writable.close();
-                const file = await receiver.fileHandle.getFile();
-                const type = receiver.mimeType || getFallbackMimeType(receiver.name);
-                const typedFile = file.slice(0, file.size, type);
-                url = URL.createObjectURL(typedFile);
-                addSystemMessage(`Saved ${receiver.name} to disk`);
-            } catch (e) {
-                console.error("Error closing file stream", e);
-            }
-        } else {
-            const sortedChunks = Array.from(receiver.chunks.entries())
-                .sort((a: any, b: any) => a[0] - b[0])
-                .map((entry: any) => entry[1]);
+            peer.on('error', (err) => {
+                console.error('Peer error:', err.type, err);
 
-            const type = receiver.mimeType || getFallbackMimeType(receiver.name);
-            const blob = new Blob(sortedChunks, { type });
-            url = URL.createObjectURL(blob);
-            addSystemMessage(`Received ${receiver.name}`);
-        }
+                if (err.type === 'peer-unavailable') {
+                    addSystemMessage(`Peer not found.`);
+                    return;
+                }
 
-        setMessages(prev => prev.map(m => m.id === receiver.id ? {
-            ...m,
-            progress: 100,
-            blobUrl: url,
-            needsAcceptance: false
-        } : m));
+                if (err.type === 'unavailable-id') {
+                    if (retryCount.current < 5) {
+                        retryCount.current += 1;
+                        const delay = 2000 * retryCount.current;
+                        addSystemMessage(`⚠️ ID Active. Retrying cleanup (${retryCount.current}/5) in ${delay / 1000}s...`);
 
-        fileReceivers.current.delete(receiver.id);
-    };
+                        retryTimer.current = setTimeout(() => {
+                            retryTimer.current = null;
+                            peer.destroy();
+                            initPeer();
+                        }, delay);
+                    } else {
+                        addSystemMessage('❌ ID Locked. Please close other tabs or wait 30s.');
+                        setConnectionStatus('disconnected');
+                    }
+                    return; // Early return to avoid generic error
+                }
+
+                if (err.type === 'disconnected') {
+                    peer.reconnect();
+                }
+
+                if (!connRef.current?.open) setConnectionStatus('disconnected');
+                addSystemMessage(`Error: ${err.type}`);
+            });
+        };
+
+        const timer = setTimeout(initPeer, 100); // Slight delay to allow cleanup
+
+        const handleUnload = () => {
+            endCall();
+            peerRef.current?.destroy();
+        };
+        window.addEventListener('beforeunload', handleUnload);
+
+        return () => {
+            disposed = true;
+            clearTimeout(timer);
+            if (retryTimer.current) clearTimeout(retryTimer.current);
+            window.removeEventListener('beforeunload', handleUnload);
+            endCall();
+            peerRef.current?.destroy();
+            peerRef.current = null;
+        };
+    }, [addSystemMessage, endCall]);
 
     return {
         myPeerId,
