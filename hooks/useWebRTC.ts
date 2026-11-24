@@ -647,7 +647,10 @@ export const useWebRTC = () => {
         setConnectionStatus('connecting');
         addSystemMessage(`Connecting to ${id}...`);
 
-        const conn = peer.connect(id, { reliable: true, serialization: 'none' });
+        // 'raw' passes ArrayBuffers and strings through untouched. peerjs 1.5 renamed the
+        // old 'none' value to 'raw'; passing a name it doesn't know makes it look up an
+        // undefined constructor and throw.
+        const conn = peer.connect(id, { reliable: true, serialization: 'raw' });
         const timeout = setTimeout(() => {
             if (connRef.current === conn && !conn.open) {
                 connRef.current = null;
