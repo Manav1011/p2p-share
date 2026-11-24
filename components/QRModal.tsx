@@ -9,6 +9,31 @@ interface QRModalProps {
   onClose: () => void;
 }
 
+const READER_ID = 'reader';
+
+// html5-qrcode throws bare strings *synchronously* from stop() ("Cannot stop, scanner is
+// not running or paused.") instead of rejecting, so `.catch()` never sees them. An uncaught
+// throw out of the effect cleanup propagates through React's commit phase, and with no
+// error boundary it tears down the whole tree, leaving a black page.
+// The fallback also releases the camera when stop() bails out before tearing the stream down.
+const stopScanner = (scanner: Html5Qrcode | null): Promise<void> => {
+    if (!scanner) return Promise.resolve();
+
+    const tracks = Array.from(document.querySelectorAll(`#${READER_ID} video`))
+        .flatMap((el) => ((el as HTMLVideoElement).srcObject as MediaStream | null)?.getTracks() ?? []);
+
+    let stopped: Promise<void>;
+    try {
+        stopped = scanner.stop();
+    } catch {
+        stopped = Promise.resolve();
+    }
+
+    return stopped.catch(() => { /* already stopped */ }).finally(() => {
+        tracks.forEach((t) => { try { t.stop(); } catch { /* already ended */ } });
+    });
+};
+
 export const QRModal: React.FC<QRModalProps> = ({ peerId, onConnect, onClose }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [mode, setMode] = useState<'display' | 'scan' | 'manual'>('display');
@@ -44,7 +69,7 @@ export const QRModal: React.FC<QRModalProps> = ({ peerId, onConnect, onClose }) 
 
     const timer = setTimeout(() => {
       if (cancelled) return;
-      const scanner = new Html5Qrcode('reader');
+      const scanner = new Html5Qrcode(READER_ID);
       scannerRef.current = scanner;
 
       scanner.start(
@@ -54,12 +79,12 @@ export const QRModal: React.FC<QRModalProps> = ({ peerId, onConnect, onClose }) 
           if (handled) return; // a QR code can decode several times before stop() finishes
           handled = true;
           onConnectRef.current(decodedText);
-          scanner.stop().catch(() => { /* already stopped */ }).finally(() => onCloseRef.current());
+          stopScanner(scanner).finally(() => onCloseRef.current());
         },
         () => { /* ignore per-frame decode misses */ }
       ).then(() => {
         // Cleanup ran while the camera was starting: release it right away
-        if (cancelled) scanner.stop().catch(() => { /* ignore */ });
+        if (cancelled) stopScanner(scanner);
       }).catch((err) => {
         console.error('Scanner error', err);
         if (!cancelled) setScanError('Camera unavailable. Check camera permission or use Input ID.');
@@ -71,7 +96,7 @@ export const QRModal: React.FC<QRModalProps> = ({ peerId, onConnect, onClose }) 
       clearTimeout(timer);
       const scanner = scannerRef.current;
       scannerRef.current = null;
-      if (scanner) scanner.stop().catch(() => { /* not running */ });
+      stopScanner(scanner);
     };
   }, [mode]);
 
@@ -134,7 +159,7 @@ export const QRModal: React.FC<QRModalProps> = ({ peerId, onConnect, onClose }) 
           {mode === 'scan' && (
             <div className="w-full">
               <div className="relative border border-app-accent/50">
-                <div id="reader" className="w-full h-64 bg-black"></div>
+                <div id={READER_ID} className="w-full h-64 bg-black"></div>
                 <div className="absolute inset-0 border-2 border-app-accent/30 pointer-events-none flex items-center justify-center">
                   <ScanLine size={48} className="text-app-accent opacity-50 animate-pulse" />
                 </div>
